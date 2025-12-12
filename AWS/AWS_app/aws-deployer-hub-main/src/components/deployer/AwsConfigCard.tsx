@@ -15,14 +15,12 @@ interface AwsConfigCardProps {
   config: AwsConfig;
   onConfigChange: (updates: Partial<AwsConfig>) => void;
   ecrRepositories?: string[];
-  securityGroups?: string[];
 }
 
 export function AwsConfigCard({
   config,
   onConfigChange,
   ecrRepositories = ['cpu', 'gpu', 'hpc'],
-  securityGroups = ['default', 'ssh-only', 'web-server'],
 }: AwsConfigCardProps) {
   return (
     <Card className="border-border/60 shadow-sm">
@@ -31,6 +29,20 @@ export function AwsConfigCard({
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-4">
+          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
+            <Label htmlFor="accountId" className="text-right text-sm text-muted-foreground">
+              AWS Account ID
+            </Label>
+            <Input
+              id="accountId"
+              value={config.accountId}
+              readOnly
+              disabled
+              placeholder="Auto-filled from login"
+              className="bg-muted/50 border-border/60 cursor-not-allowed"
+            />
+          </div>
+
           <div className="grid grid-cols-[140px_1fr] items-center gap-3">
             <Label htmlFor="region" className="text-right text-sm text-muted-foreground">
               AWS Region
@@ -50,19 +62,6 @@ export function AwsConfigCard({
                 ))}
               </SelectContent>
             </Select>
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="accountId" className="text-right text-sm text-muted-foreground">
-              AWS Account ID
-            </Label>
-            <Input
-              id="accountId"
-              value={config.accountId}
-              onChange={(e) => onConfigChange({ accountId: e.target.value })}
-              placeholder="095232028760"
-              className="bg-muted/50 border-border/60"
-            />
           </div>
 
           <div className="grid grid-cols-[140px_1fr] items-center gap-3">
@@ -101,27 +100,6 @@ export function AwsConfigCard({
                 {INSTANCE_TYPES.map((type) => (
                   <SelectItem key={type.value} value={type.value}>
                     {type.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="securityGroup" className="text-right text-sm text-muted-foreground">
-              Security Group
-            </Label>
-            <Select
-              value={config.securityGroup}
-              onValueChange={(value) => onConfigChange({ securityGroup: value })}
-            >
-              <SelectTrigger className="bg-muted/50 border-border/60">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {securityGroups.map((sg) => (
-                  <SelectItem key={sg} value={sg}>
-                    {sg}
                   </SelectItem>
                 ))}
               </SelectContent>

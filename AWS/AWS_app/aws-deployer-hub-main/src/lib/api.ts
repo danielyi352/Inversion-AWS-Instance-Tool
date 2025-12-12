@@ -81,7 +81,7 @@ export function deploy(config: AwsConfig & { accountId: string }) {
       account_id: config.accountId,
       repository: config.ecrRepository,
       instance_type: config.instanceType,
-      security_group: config.securityGroup,
+      security_group: null,  // Will use default automatically
       volume_size: config.volumeSize,
     }),
   });
@@ -94,7 +94,7 @@ export function deployStream(config: AwsConfig & { accountId: string }) {
     account_id: config.accountId,
     repository: config.ecrRepository,
     instance_type: config.instanceType,
-    security_group: config.securityGroup,
+    security_group: "",  // Will use default automatically
     volume_size: String(config.volumeSize),
   });
   

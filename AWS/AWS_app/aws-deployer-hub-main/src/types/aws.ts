@@ -3,7 +3,6 @@ export interface AwsConfig {
   accountId: string;
   ecrRepository: string;
   instanceType: string;
-  securityGroup: string;
   volumeSize: number;
 }
 

@@ -25,9 +25,10 @@ interface RoleLoginDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onLogin: (roleArn: string, externalId: string, region: string) => Promise<void>;
+  required?: boolean; // If true, dialog cannot be closed without logging in
 }
 
-export function RoleLoginDialog({ open, onOpenChange, onLogin }: RoleLoginDialogProps) {
+export function RoleLoginDialog({ open, onOpenChange, onLogin, required = false }: RoleLoginDialogProps) {
   const [roleArn, setRoleArn] = useState('');
   const [externalId, setExternalId] = useState('');
   const [region, setRegion] = useState('us-east-1');
@@ -53,12 +54,24 @@ export function RoleLoginDialog({ open, onOpenChange, onLogin }: RoleLoginDialog
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[500px]">
+    <Dialog 
+      open={open} 
+      onOpenChange={(newOpen) => {
+        // If required, prevent closing (only allow if newOpen is true, i.e., opening)
+        if (required && !newOpen) {
+          // Prevent closing when required
+          return;
+        }
+        onOpenChange(newOpen);
+      }}
+    >
+      <DialogContent className={`sm:max-w-[500px] ${required ? '[&>button.absolute]:hidden' : ''}`}>
         <DialogHeader>
           <DialogTitle>Login with IAM Role ARN</DialogTitle>
           <DialogDescription>
-            Enter your IAM Role ARN to authenticate. The role must be configured to trust this application's AWS account.
+            {required 
+              ? "Login is required to use Inversion Deployer. Enter your IAM Role ARN to authenticate."
+              : "Enter your IAM Role ARN to authenticate. The role must be configured to trust this application's AWS account."}
           </DialogDescription>
         </DialogHeader>
         
@@ -122,14 +135,16 @@ export function RoleLoginDialog({ open, onOpenChange, onLogin }: RoleLoginDialog
           </div>
 
           <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-              disabled={loading}
-            >
-              Cancel
-            </Button>
+            {!required && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={loading}
+              >
+                Cancel
+              </Button>
+            )}
             <Button type="submit" disabled={loading || !roleArn}>
               {loading ? 'Logging in...' : 'Login'}
             </Button>

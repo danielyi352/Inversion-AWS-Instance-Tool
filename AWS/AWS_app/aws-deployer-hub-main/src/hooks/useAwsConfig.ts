@@ -9,7 +9,6 @@ const defaultConfig: AwsConfig = {
   accountId: '',
   ecrRepository: '',
   instanceType: 't3.medium',
-  securityGroup: 'default',
   volumeSize: 30,
 };
 
@@ -332,6 +331,26 @@ export function useAwsConfig() {
     }
   };
 
+  const handleLogout = () => {
+    // Close any active deployment streams
+    if (deploySource) {
+      deploySource.close();
+      setDeploySource(null);
+    }
+    
+    // Clear session
+    localStorage.removeItem('aws_session_id');
+    setIsLoggedIn(false);
+    
+    // Clear state
+    setInstances([]);
+    setSelectedInstance(null);
+    setMetadata({ repositories: [], securityGroups: [] });
+    setProgress(0);
+    
+    addLog('Logged out successfully', 'info');
+  };
+
   return {
     config,
     updateConfig,
@@ -356,5 +375,6 @@ export function useAwsConfig() {
     handleConnect,
     handleUpload,
     handleDownload,
+    handleLogout,
   };
 }

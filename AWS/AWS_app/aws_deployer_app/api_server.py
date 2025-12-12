@@ -66,7 +66,7 @@ class DeployRequestModel(BaseModel):
     repository: str
     instance_type: str
     key_pair: Optional[str] = Field(None, description="EC2 key pair name (deprecated - not used, SSM is used instead)")
-    security_group: str
+    security_group: Optional[str] = Field(None, description="Security group name (optional - defaults to 'inversion-deployer-default')")
     volume_size: int = Field(default=30, ge=1, le=2048)
 
 
@@ -494,7 +494,10 @@ def _get_latest_ami(ec2_client, ssm_client, repository: str, region: str, log_ca
 
 
 def _ensure_security_group(ec2_client, security_group_name: str, repository: str, region: str, log_callback=None) -> str:
-    """Ensure security group exists and has SSH access. Returns security group ID."""
+    """Ensure security group exists. Returns security group ID.
+    
+    Note: No inbound rules are added - SSM uses outbound HTTPS connections only.
+    """
     try:
         # Check if security group exists
         response = ec2_client.describe_security_groups(GroupNames=[security_group_name])
@@ -507,49 +510,17 @@ def _ensure_security_group(ec2_client, security_group_name: str, repository: str
             try:
                 response = ec2_client.create_security_group(
                     GroupName=security_group_name,
-                    Description=f"Security group for {repository} Docker container"
+                    Description=f"Security group for {repository} Docker container (SSM-only, no inbound rules needed)"
                 )
                 sg_id = response['GroupId']
                 if log_callback:
-                    log_callback(_log_message(f"Created security group: {sg_id}"))
+                    log_callback(_log_message(f"Created security group: {sg_id} (SSM-only, no SSH rules)"))
             except ClientError as create_err:
                 raise HTTPException(status_code=500, detail=f"Failed to create security group: {create_err}")
         else:
             raise
     
-    # Check if SSH rule exists
-    try:
-        response = ec2_client.describe_security_groups(GroupIds=[sg_id])
-        sg = response['SecurityGroups'][0]
-        has_ssh = False
-        for perm in sg.get('IpPermissions', []):
-            if perm.get('IpProtocol') == 'tcp' and perm.get('FromPort') == 22:
-                for ip_range in perm.get('IpRanges', []):
-                    if ip_range.get('CidrIp') == '0.0.0.0/0':
-                        has_ssh = True
-                        break
-                if has_ssh:
-                    break
-        
-        if not has_ssh:
-            try:
-                ec2_client.authorize_security_group_ingress(
-                    GroupId=sg_id,
-                    IpPermissions=[{
-                        'IpProtocol': 'tcp',
-                        'FromPort': 22,
-                        'ToPort': 22,
-                        'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'SSH access'}]
-                    }]
-                )
-                if log_callback:
-                    log_callback(_log_message(f"Authorized SSH ingress (tcp/22 0.0.0.0/0) on {security_group_name}"))
-            except ClientError as auth_err:
-                if auth_err.response['Error']['Code'] != 'InvalidPermission.Duplicate':
-                    raise HTTPException(status_code=500, detail=f"Failed to authorize SSH access: {auth_err}")
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to check security group rules: {e}")
-    
+    # No SSH rules needed - SSM uses outbound HTTPS (port 443) which is allowed by default
     return sg_id
 
 
@@ -864,12 +835,13 @@ def _deploy_with_boto3(req: DeployRequestModel, session_creds: Optional[Dict[str
         log("Checking AWS prerequisites...")
         ami_id, root_device_name = _get_latest_ami(ec2_client, ssm_client, req.repository, req.region, log)
         
-        # Step 2: Ensure security group
-        _ensure_security_group(ec2_client, req.security_group, req.repository, req.region, log)
+        # Step 2: Ensure security group (use default name if not provided)
+        security_group_name = req.security_group or f"inversion-deployer-default-{req.account_id}"
+        _ensure_security_group(ec2_client, security_group_name, req.repository, req.region, log)
         
         # Step 3: Launch instance (no key pair needed - using SSM for all access)
         instance_id, public_dns = _launch_ec2_instance(
-            ec2_client, iam_client, ami_id, req.instance_type, req.security_group,
+            ec2_client, iam_client, ami_id, req.instance_type, security_group_name,
             root_device_name, req.volume_size, req.repository, req.account_id, req.region, log
         )
         
@@ -1193,7 +1165,7 @@ def deploy_stream(
     repository: str = "",
     instance_type: str = "",
     key_pair: str = "",
-    security_group: str = "",
+    security_group: str = "",  # Deprecated - not used, will use default
     volume_size: int = 30,
     session_id: Optional[str] = None,  # Query parameter for EventSource
 ):
@@ -1221,7 +1193,7 @@ def deploy_stream(
         repository=repository,
         instance_type=instance_type,
         key_pair=None,  # Not used - SSM is used instead
-        security_group=security_group,
+        security_group=None,  # Will use default name automatically
         volume_size=volume_size,
     )
 
