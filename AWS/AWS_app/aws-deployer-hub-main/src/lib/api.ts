@@ -77,12 +77,10 @@ export function deploy(config: AwsConfig & { accountId: string }) {
   return apiFetch<DeployResponse>("/deploy", {
     method: "POST",
     body: JSON.stringify({
-      profile: config.profile || "",  // Optional for session-based auth
       region: config.region,
       account_id: config.accountId,
       repository: config.ecrRepository,
       instance_type: config.instanceType,
-      key_pair: config.keyPair,
       security_group: config.securityGroup,
       volume_size: config.volumeSize,
     }),
@@ -92,12 +90,10 @@ export function deploy(config: AwsConfig & { accountId: string }) {
 export function deployStream(config: AwsConfig & { accountId: string }) {
   const sessionId = getSessionId();
   const params = new URLSearchParams({
-    profile: config.profile || "",  // Optional for session-based auth
     region: config.region,
     account_id: config.accountId,
     repository: config.ecrRepository,
     instance_type: config.instanceType,
-    key_pair: config.keyPair,
     security_group: config.securityGroup,
     volume_size: String(config.volumeSize),
   });

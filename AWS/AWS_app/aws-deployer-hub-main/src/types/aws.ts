@@ -1,10 +1,8 @@
 export interface AwsConfig {
-  profile: string;
   region: string;
   accountId: string;
   ecrRepository: string;
   instanceType: string;
-  keyPair: string;
   securityGroup: string;
   volumeSize: number;
 }
@@ -33,7 +31,6 @@ export interface TransferStatus {
 
 export interface AwsMetadata {
   repositories: string[];
-  keyPairs: string[];
   securityGroups: string[];
 }
 

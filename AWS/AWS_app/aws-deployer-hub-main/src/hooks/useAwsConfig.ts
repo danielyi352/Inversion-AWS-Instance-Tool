@@ -5,12 +5,10 @@ import { assumeRoleLogin, connect, deployStream, downloadFile, fetchInstances, f
 const STORAGE_KEY = 'inversion-deployer-config';
 
 const defaultConfig: AwsConfig = {
-  profile: '',
   region: 'us-east-1',
   accountId: '',
   ecrRepository: '',
   instanceType: 't3.medium',
-  keyPair: '',
   securityGroup: 'default',
   volumeSize: 30,
 };
@@ -25,7 +23,6 @@ export function useAwsConfig() {
   const [progress, setProgress] = useState(0);
   const [metadata, setMetadata] = useState<AwsMetadata>({
     repositories: [],
-    keyPairs: [],
     securityGroups: [],
   });
   const [transferStatus, setTransferStatus] = useState<TransferStatus>({

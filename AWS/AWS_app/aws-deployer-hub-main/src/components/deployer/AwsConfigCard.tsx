@@ -15,7 +15,6 @@ interface AwsConfigCardProps {
   config: AwsConfig;
   onConfigChange: (updates: Partial<AwsConfig>) => void;
   ecrRepositories?: string[];
-  keyPairs?: string[];
   securityGroups?: string[];
 }
 
@@ -23,7 +22,6 @@ export function AwsConfigCard({
   config,
   onConfigChange,
   ecrRepositories = ['cpu', 'gpu', 'hpc'],
-  keyPairs = ['HPC-1', 'Default-Key', 'Create new key...'],
   securityGroups = ['default', 'ssh-only', 'web-server'],
 }: AwsConfigCardProps) {
   return (
@@ -33,19 +31,6 @@ export function AwsConfigCard({
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-4">
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="profile" className="text-right text-sm text-muted-foreground">
-              AWS Profile
-            </Label>
-            <Input
-              id="profile"
-              value={config.profile}
-              onChange={(e) => onConfigChange({ profile: e.target.value })}
-              placeholder="Daniel-Inversion"
-              className="bg-muted/50 border-border/60"
-            />
-          </div>
-
           <div className="grid grid-cols-[140px_1fr] items-center gap-3">
             <Label htmlFor="region" className="text-right text-sm text-muted-foreground">
               AWS Region
@@ -116,27 +101,6 @@ export function AwsConfigCard({
                 {INSTANCE_TYPES.map((type) => (
                   <SelectItem key={type.value} value={type.value}>
                     {type.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="keyPair" className="text-right text-sm text-muted-foreground">
-              Key Pair
-            </Label>
-            <Select
-              value={config.keyPair}
-              onValueChange={(value) => onConfigChange({ keyPair: value })}
-            >
-              <SelectTrigger className="bg-muted/50 border-border/60">
-                <SelectValue placeholder="Select key pair" />
-              </SelectTrigger>
-              <SelectContent>
-                {keyPairs.map((pair) => (
-                  <SelectItem key={pair} value={pair}>
-                    {pair}
                   </SelectItem>
                 ))}
               </SelectContent>

@@ -61,7 +61,6 @@ export function InversionDeployer() {
               config={config}
               onConfigChange={updateConfig}
               ecrRepositories={metadata.repositories}
-              keyPairs={metadata.keyPairs}
               securityGroups={metadata.securityGroups}
             />
             <StatusCard

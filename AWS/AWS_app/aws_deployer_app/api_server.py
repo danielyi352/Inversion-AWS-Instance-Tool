@@ -60,12 +60,12 @@ class AssumeRoleLoginRequest(BaseModel):
 
 
 class DeployRequestModel(BaseModel):
-    profile: str
+    profile: Optional[str] = Field(None, description="AWS profile (deprecated - not used, session-based auth is used instead)")
     region: str
     account_id: str
     repository: str
     instance_type: str
-    key_pair: Optional[str] = Field(None, description="EC2 key pair name (optional, only needed for manual SSH access)")
+    key_pair: Optional[str] = Field(None, description="EC2 key pair name (deprecated - not used, SSM is used instead)")
     security_group: str
     volume_size: int = Field(default=30, ge=1, le=2048)
 
@@ -440,65 +440,7 @@ def _ensure_iam_role(iam_client, role_name: str, account_id: str, log_callback=N
             raise HTTPException(status_code=500, detail=f"Failed to check IAM role: {e}")
 
 
-def _ensure_key_pair(ec2_client, key_pair_name: str, region: str, log_callback=None) -> Optional[str]:
-    """Check if key pair exists, create if not. Returns path to key file or None."""
-    try:
-        # Check if key pair exists
-        ec2_client.describe_key_pairs(KeyNames=[key_pair_name])
-        if log_callback:
-            log_callback(_log_message(f"Key pair {key_pair_name} already exists in AWS"))
-        # Try to find local key file in multiple locations
-        possible_paths = [
-            os.path.expanduser(f"~/.ssh/{key_pair_name}.pem"),
-            os.path.expanduser(f"~/.ssh/{key_pair_name}"),
-            os.path.join(os.path.expanduser("~"), key_pair_name + ".pem"),
-        ]
-        
-        for key_path in possible_paths:
-            if os.path.exists(key_path):
-                if log_callback:
-                    log_callback(_log_message(f"Found SSH key at {key_path}"))
-                return key_path
-        
-        # Key exists in AWS but not locally - this is a problem
-        if log_callback:
-            log_callback(_log_message(f"[ERROR] Key pair {key_pair_name} exists in AWS but local key file not found"))
-            log_callback(_log_message(f"[ERROR] Please ensure the key file exists at ~/.ssh/{key_pair_name}.pem"))
-            log_callback(_log_message(f"[ERROR] Or delete the key pair in AWS and let the system create a new one"))
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Key pair '{key_pair_name}' exists in AWS but local key file not found. "
-                f"Please either:\n"
-                f"1. Place your key file at ~/.ssh/{key_pair_name}.pem\n"
-                f"2. Or delete the key pair in AWS Console and let the system create a new one"
-            )
-        )
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'InvalidKeyPair.NotFound':
-            # Create key pair
-            try:
-                response = ec2_client.create_key_pair(KeyName=key_pair_name)
-                key_material = response['KeyMaterial']
-                
-                # Save to ~/.ssh/
-                ssh_dir = os.path.expanduser("~/.ssh")
-                os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-                key_path = os.path.join(ssh_dir, f"{key_pair_name}.pem")
-                
-                with open(key_path, 'w', encoding='utf-8') as f:
-                    f.write(key_material)
-                os.chmod(key_path, 0o600)
-                
-                if log_callback:
-                    log_callback(_log_message(f"Key pair {key_pair_name} created and saved to {key_path}"))
-                return key_path
-            except Exception as exc:
-                if log_callback:
-                    log_callback(_log_message(f"[ERROR] Failed to create key pair: {exc}"))
-                raise HTTPException(status_code=500, detail=f"Failed to create key pair: {exc}")
-        else:
-            raise
+# Key pair functions removed - all access is via SSM using IAM instance profiles
 
 
 def _get_latest_ami(ec2_client, ssm_client, repository: str, region: str, log_callback=None) -> tuple:
@@ -611,10 +553,13 @@ def _ensure_security_group(ec2_client, security_group_name: str, repository: str
     return sg_id
 
 
-def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str, key_pair_name: Optional[str],
+def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str,
                         security_group_name: str, root_device_name: str, volume_size: int,
                         repository: str, account_id: str, region: str, log_callback=None) -> tuple:
-    """Launch EC2 instance and wait for it to be running. Returns (instance_id, public_dns)."""
+    """Launch EC2 instance and wait for it to be running. Returns (instance_id, public_dns).
+    
+    Note: Key pairs are not used - all access is via SSM.
+    """
     if log_callback:
         log_callback(_log_message("Launching EC2 instance..."))
     
@@ -635,6 +580,7 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
         )
     
     # Build run_instances parameters
+    # Note: No KeyName - all access is via SSM using the IAM instance profile
     run_params = {
         'ImageId': ami_id,
         'InstanceType': instance_type,
@@ -657,10 +603,6 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
         'MinCount': 1,
         'MaxCount': 1
     }
-    
-    # Key pair is optional (only needed for manual SSH access)
-    if key_pair_name:
-        run_params['KeyName'] = key_pair_name
     
     try:
         response = ec2_client.run_instances(**run_params)
@@ -744,7 +686,7 @@ def _wait_for_ssm(ssm_client, instance_id: str, log_callback=None, max_retries: 
             time.sleep(10)
     
     raise HTTPException(
-        status_code=500, 
+        status_code=500,
         detail=f"SSM connection failed after {max_retries * 10} seconds. Instance may still be initializing. Ensure the instance has an IAM role with SSM permissions."
     )
 
@@ -925,9 +867,9 @@ def _deploy_with_boto3(req: DeployRequestModel, session_creds: Optional[Dict[str
         # Step 2: Ensure security group
         _ensure_security_group(ec2_client, req.security_group, req.repository, req.region, log)
         
-        # Step 3: Launch instance (key pair is optional now, only needed for manual SSH access)
+        # Step 3: Launch instance (no key pair needed - using SSM for all access)
         instance_id, public_dns = _launch_ec2_instance(
-            ec2_client, iam_client, ami_id, req.instance_type, req.key_pair, req.security_group,
+            ec2_client, iam_client, ami_id, req.instance_type, req.security_group,
             root_device_name, req.volume_size, req.repository, req.account_id, req.region, log
         )
         
@@ -1073,7 +1015,7 @@ def sso_login(body: LoginRequest):
 
 @app.get("/api/metadata")
 def metadata(request: Request, profile: Optional[str] = None, region: str = "us-east-1"):
-    """Fetch repositories, key pairs, and security groups."""
+    """Fetch repositories and security groups."""
     # Check for session-based auth first
     session_id = request.headers.get("X-Session-ID")
     
@@ -1130,15 +1072,6 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
             else:
                 raise
         
-        # List EC2 key pairs
-        key_pairs = []
-        try:
-            key_pairs = [k["KeyName"] for k in ec2.describe_key_pairs().get("KeyPairs", [])]
-        except ClientError as ec2_exc:
-            error_code = ec2_exc.response.get('Error', {}).get('Code', 'Unknown')
-            print(f"[WARNING] EC2 describe_key_pairs error: {error_code}")
-            key_pairs = []
-        
         # List security groups
         security_groups = []
         try:
@@ -1152,7 +1085,7 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
             security_groups = []
         
         # Log for debugging
-        print(f"[DEBUG] Metadata fetch - Region: {region}, Repos: {len(repos)}, KeyPairs: {len(key_pairs)}, SecurityGroups: {len(security_groups)}")
+        print(f"[DEBUG] Metadata fetch - Region: {region}, Repos: {len(repos)}, SecurityGroups: {len(security_groups)}")
         if repos:
             print(f"[DEBUG] Repository names: {repos}")
         
@@ -1170,7 +1103,6 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
 
     return {
         "repositories": repos,
-        "keyPairs": key_pairs,
         "securityGroups": security_groups,
     }
 
@@ -1190,7 +1122,7 @@ def instances(request: Request, profile: Optional[str] = None, region: str = "us
         # Legacy: use profile-based auth
         session = _session(profile, region)
     else:
-        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
+        raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
     
     ec2 = session.client("ec2")
     try:
@@ -1279,16 +1211,16 @@ def deploy_stream(
             account_id = session_creds['account_id']
         if not region:
             region = session_creds['region']
-    elif not profile:
-        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
+    elif not session_id:
+        raise HTTPException(status_code=400, detail="Session ID is required. Please login first.")
 
     req = DeployRequestModel(
-        profile=profile or "default",
+        profile=None,  # Not used - session-based auth only
         region=region,
         account_id=account_id or "",
         repository=repository,
         instance_type=instance_type,
-        key_pair=key_pair,
+        key_pair=None,  # Not used - SSM is used instead
         security_group=security_group,
         volume_size=volume_size,
     )
@@ -1516,24 +1448,33 @@ def upload(request: Request, body: UploadRequest):
             raise HTTPException(status_code=404, detail=f"Local file not found: {local_path}")
         
         s3_client.upload_file(local_path, bucket_name, s3_key)
-        s3_url = f"s3://{bucket_name}/{s3_key}"
         
-        # Step 3: Use SSM to download from S3 to instance
+        # Step 3: Generate presigned URL for download (valid for 1 hour)
+        presigned_url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket_name, 'Key': s3_key},
+            ExpiresIn=3600
+        )
+        
+        # Step 4: Use SSM to download from presigned URL to instance (no AWS CLI needed)
+        # Escape the presigned URL for shell safety
+        presigned_url_escaped = shlex.quote(presigned_url)
+        
         if body.container_name:
             # Upload to container: copy to instance first, then into container
             instance_path = f"/tmp/{os.path.basename(body.local_path)}"
-            download_cmd = f"aws s3 cp {s3_url} {instance_path}"
-            copy_to_container_cmd = f"docker cp {instance_path} {body.container_name}:{body.destination_path} && rm -f {instance_path}"
+            # Use curl to download from presigned URL
+            download_cmd = f"curl -f -o {shlex.quote(instance_path)} {presigned_url_escaped}"
+            copy_to_container_cmd = f"docker cp {shlex.quote(instance_path)} {shlex.quote(body.container_name)}:{shlex.quote(body.destination_path)} && rm -f {shlex.quote(instance_path)}"
             command = f"{download_cmd} && {copy_to_container_cmd}"
         else:
             # Upload to instance filesystem
-            command = f"aws s3 cp {s3_url} {body.destination_path}"
+            command = f"curl -f -o {shlex.quote(body.destination_path)} {presigned_url_escaped}"
         
         response = ssm_client.send_command(
             InstanceIds=[body.instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={'commands': [command]},
-            TimeoutSeconds=300
+            Parameters={'commands': [command]}
         )
         command_id = response['Command']['CommandId']
         
@@ -1625,26 +1566,36 @@ def download(request: Request, body: DownloadRequest):
                     if create_err.response.get('Error', {}).get('Code') != 'BucketAlreadyOwnedByYou':
                         raise
         
-        # Step 2: Use SSM to upload from instance to S3
+        # Step 2: Generate presigned PUT URL for upload (valid for 1 hour)
+        presigned_put_url = s3_client.generate_presigned_url(
+            'put_object',
+            Params={'Bucket': bucket_name, 'Key': s3_key},
+            ExpiresIn=3600
+        )
+        
+        # Step 3: Use SSM to upload from instance to S3 using presigned URL (no AWS CLI needed)
+        # Escape the presigned URL for shell safety
+        presigned_put_url_escaped = shlex.quote(presigned_put_url)
+        
         if body.container_name:
             # Download from container: copy from container to instance first, then to S3
             instance_path = f"/tmp/{os.path.basename(body.remote_path)}"
-            copy_from_container_cmd = f"docker cp {body.container_name}:{body.remote_path} {instance_path}"
-            upload_cmd = f"aws s3 cp {instance_path} s3://{bucket_name}/{s3_key} && rm -f {instance_path}"
+            copy_from_container_cmd = f"docker cp {shlex.quote(body.container_name)}:{shlex.quote(body.remote_path)} {shlex.quote(instance_path)}"
+            # Use curl to upload to presigned URL
+            upload_cmd = f"curl -f -X PUT -T {shlex.quote(instance_path)} {presigned_put_url_escaped} && rm -f {shlex.quote(instance_path)}"
             command = f"{copy_from_container_cmd} && {upload_cmd}"
         else:
             # Download from instance filesystem
-            command = f"aws s3 cp {body.remote_path} s3://{bucket_name}/{s3_key}"
+            command = f"curl -f -X PUT -T {shlex.quote(body.remote_path)} {presigned_put_url_escaped}"
         
         response = ssm_client.send_command(
             InstanceIds=[body.instance_id],
             DocumentName="AWS-RunShellScript",
-            Parameters={'commands': [command]},
-            TimeoutSeconds=300
+            Parameters={'commands': [command]}
         )
         command_id = response['Command']['CommandId']
         
-        # Step 3: Wait for command to complete
+        # Step 4: Wait for command to complete
         import time
         for _ in range(30):  # Wait up to 5 minutes
             time.sleep(10)
@@ -1663,7 +1614,7 @@ def download(request: Request, body: DownloadRequest):
                 detail=f"SSM command failed: {error_output}"
             )
         
-        # Step 4: Download from S3 to local
+        # Step 5: Download from S3 to local
         local_path = os.path.expanduser(body.local_path or ".")
         if os.path.isdir(local_path):
             # If local_path is a directory, append filename
