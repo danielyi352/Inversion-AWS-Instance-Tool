@@ -29,8 +29,11 @@ export function InversionDeployer() {
     clearLogs,
     progress,
     metadata,
+    repositoryStatus,
+    clearRepositoryStatus,
     handleRoleLogin,
     handleRefresh,
+    handleConnectRepository,
     handleDeploy,
     handleTerminate,
     handleConnect,
@@ -104,6 +107,9 @@ export function InversionDeployer() {
               config={config}
               onConfigChange={updateConfig}
               ecrRepositories={metadata.repositories}
+              onConnectRepository={handleConnectRepository}
+              repositoryStatus={repositoryStatus}
+              onClearRepositoryStatus={clearRepositoryStatus}
             />
               <StatusCard
                 isLoggedIn={isLoggedIn}
@@ -130,6 +136,7 @@ export function InversionDeployer() {
             <ActionToolbar
               isLoggedIn={isLoggedIn}
               hasSelectedInstance={!!selectedInstance}
+              repositoryHasImages={repositoryStatus?.hasImages ?? false}
               onRoleLogin={() => setLoginDialogOpen(true)}
               onRefresh={handleRefresh}
               onDeploy={handleDeploy}

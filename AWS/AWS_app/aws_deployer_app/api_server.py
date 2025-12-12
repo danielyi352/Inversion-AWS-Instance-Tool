@@ -656,8 +656,8 @@ def _wait_for_ssm(ssm_client, instance_id: str, log_callback=None, max_retries: 
         if attempt < max_retries - 1:
             time.sleep(10)
     
-    raise HTTPException(
-        status_code=500,
+        raise HTTPException(
+            status_code=500,
         detail=f"SSM connection failed after {max_retries * 10} seconds. Instance may still be initializing. Ensure the instance has an IAM role with SSM permissions."
     )
 
@@ -863,7 +863,7 @@ def _deploy_with_boto3(req: DeployRequestModel, session_creds: Optional[Dict[str
         _pull_and_run_container(ssm_client, instance_id, ecr_registry, req.repository, "latest", req.account_id, req.region, log)
         
         log("Deployment completed successfully!")
-        
+
         return {
             "instance": {
                 "id": instance_id,
@@ -995,8 +995,14 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
         try:
             # Use assumed role credentials
             creds = _get_session_credentials(session_id)
-            session = _session_from_credentials(creds, creds['region'])
-            region = creds['region']  # Use region from session
+            # Use region from query parameter if explicitly provided, otherwise use session region
+            query_region = request.query_params.get("region")
+            if query_region:
+                region = query_region
+            else:
+                # No region in query params, use session's region
+                region = creds.get('region', region)
+            session = _session_from_credentials(creds, region)
         except HTTPException as e:
             # Re-raise HTTP exceptions (401, etc.) as-is
             raise
@@ -1079,6 +1085,126 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
     }
 
 
+@app.get("/api/repositories/{repository}/status")
+def repository_status(
+    request: Request,
+    repository: str,
+    region: str = "us-east-1"
+):
+    """Check if repository exists and has images."""
+    session_id = request.headers.get("X-Session-ID")
+    
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
+    
+    try:
+        creds = _get_session_credentials(session_id)
+        # Use region from query parameter if explicitly provided, otherwise use session region
+        query_region = request.query_params.get("region")
+        if query_region:
+            region = query_region
+        else:
+            region = creds.get('region', region)
+        session = _session_from_credentials(creds, region)
+        account_id = creds.get('account_id', '')
+    except HTTPException as e:
+        raise
+    
+    ecr = session.client("ecr", region_name=region)
+    
+    # Debug logging
+    print(f"[DEBUG] Checking repository '{repository}' in region '{region}' for account '{account_id}'")
+    
+    try:
+        # Check if repository exists
+        try:
+            repo_info = ecr.describe_repositories(repositoryNames=[repository])
+            repo_uri = repo_info['repositories'][0]['repositoryUri']
+            print(f"[DEBUG] Repository '{repository}' found in region '{region}': {repo_uri}")
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_msg = e.response['Error'].get('Message', '')
+            print(f"[DEBUG] Repository '{repository}' not found in region '{region}': {error_code} - {error_msg}")
+            
+            # Try to list all repositories in this region to help debug
+            try:
+                all_repos = ecr.describe_repositories()
+                repo_names = [r['repositoryName'] for r in all_repos.get('repositories', [])]
+                print(f"[DEBUG] Available repositories in region '{region}': {repo_names}")
+                if repo_names:
+                    return {
+                        "exists": False,
+                        "hasImages": False,
+                        "imageCount": 0,
+                        "images": [],
+                        "message": f"Repository '{repository}' not found in region '{region}'. Available repositories: {', '.join(repo_names)}"
+                    }
+            except Exception as list_err:
+                print(f"[DEBUG] Could not list repositories for debugging: {list_err}")
+            
+            if error_code == 'RepositoryNotFoundException':
+                return {
+                    "exists": False,
+                    "hasImages": False,
+                    "imageCount": 0,
+                    "images": [],
+                    "message": f"Repository '{repository}' not found in region '{region}'. Please check that the repository exists in this region."
+                }
+            raise
+        
+        # List images in repository
+        try:
+            images_response = ecr.list_images(repositoryName=repository)
+            images = images_response.get('imageIds', [])
+            
+            # Get image details (tags, pushed date, etc.)
+            if images:
+                image_details = []
+                for image_id in images:
+                    detail = {
+                        "imageDigest": image_id.get('imageDigest', ''),
+                        "imageTag": image_id.get('imageTag', 'untagged'),
+                    }
+                    image_details.append(detail)
+                
+                return {
+                    "exists": True,
+                    "hasImages": True,
+                    "imageCount": len(images),
+                    "images": image_details,
+                    "repositoryUri": repo_uri,
+                    "message": f"Repository has {len(images)} image(s)"
+                }
+            else:
+                return {
+                    "exists": True,
+                    "hasImages": False,
+                    "imageCount": 0,
+                    "images": [],
+                    "repositoryUri": repo_uri,
+                    "message": "Repository exists but is empty"
+                }
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == 'RepositoryNotFoundException':
+                return {
+                    "exists": False,
+                    "hasImages": False,
+                    "imageCount": 0,
+                    "images": [],
+                    "message": f"Repository '{repository}' not found"
+                }
+            raise
+            
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to check repository status: {error_code} - {error_msg}"
+        )
+
+
 @app.get("/api/instances")
 def instances(request: Request, profile: Optional[str] = None, region: str = "us-east-1"):
     """List running EC2 instances."""
@@ -1088,15 +1214,21 @@ def instances(request: Request, profile: Optional[str] = None, region: str = "us
     if session_id:
         # Use assumed role credentials
         creds = _get_session_credentials(session_id)
-        session = _session_from_credentials(creds, creds['region'])
-        region = creds['region']  # Use region from session
+        # Use region from query parameter if explicitly provided, otherwise use session region
+        query_region = request.query_params.get("region")
+        if query_region:
+            region = query_region
+        else:
+            # No region in query params, use session's region
+            region = creds.get('region', region)
+        session = _session_from_credentials(creds, region)
     elif profile:
         # Legacy: use profile-based auth
         session = _session(profile, region)
     else:
         raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
     
-    ec2 = session.client("ec2")
+    ec2 = session.client("ec2", region_name=region)
     try:
         resp = ec2.describe_instances(
             Filters=[

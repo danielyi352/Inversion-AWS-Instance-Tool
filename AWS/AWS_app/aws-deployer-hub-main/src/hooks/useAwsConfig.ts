@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { AwsConfig, RunningInstance, LogEntry, TransferStatus, AwsMetadata } from '@/types/aws';
-import { assumeRoleLogin, connect, deployStream, downloadFile, fetchInstances, fetchMetadata, loginSso, terminate, uploadFile } from '@/lib/api';
+import { assumeRoleLogin, checkRepositoryStatus, connect, deployStream, downloadFile, fetchInstances, fetchMetadata, loginSso, terminate, uploadFile } from '@/lib/api';
+import { toast } from 'sonner';
 
 const STORAGE_KEY = 'inversion-deployer-config';
 
@@ -31,6 +32,14 @@ export function useAwsConfig() {
     currentFile: '',
   });
   const [deploySource, setDeploySource] = useState<EventSource | null>(null);
+  const [repositoryStatus, setRepositoryStatus] = useState<{
+    exists: boolean;
+    hasImages: boolean;
+    imageCount: number;
+    images: Array<{imageTag: string; imageDigest: string}>;
+    repositoryUri?: string;
+    message: string;
+  } | null>(null);
 
   // Check for existing session on load
   useEffect(() => {
@@ -175,6 +184,43 @@ export function useAwsConfig() {
       }
     } finally {
       setTimeout(() => setProgress(0), 400);
+    }
+  };
+
+  const handleConnectRepository = async (repository: string, region: string) => {
+    if (!repository) {
+      setRepositoryStatus(null);
+      return {
+        exists: false,
+        hasImages: false,
+        imageCount: 0,
+        images: [],
+        message: '',
+      };
+    }
+
+    try {
+      const status = await checkRepositoryStatus(repository, region);
+      setRepositoryStatus(status);
+      
+      if (!status.exists) {
+        toast.error(`Repository '${repository}' not found`);
+        addLog(`Repository '${repository}' not found`, 'error');
+      } else if (!status.hasImages) {
+        toast.warning('Repository is empty. Please push an image first.');
+        addLog('Repository is empty. Please push an image first.', 'warning');
+      } else {
+        toast.success(`Repository connected! Found ${status.imageCount} image(s)`);
+        addLog(`Repository connected! Found ${status.imageCount} image(s)`, 'success');
+      }
+      
+      return status;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      toast.error(`Failed to check repository: ${errorMessage}`);
+      addLog(`Failed to check repository: ${errorMessage}`, 'error');
+      setRepositoryStatus(null);
+      throw error;
     }
   };
 
@@ -346,9 +392,14 @@ export function useAwsConfig() {
     setInstances([]);
     setSelectedInstance(null);
     setMetadata({ repositories: [], securityGroups: [] });
+    setRepositoryStatus(null);
     setProgress(0);
     
     addLog('Logged out successfully', 'info');
+  };
+
+  const clearRepositoryStatus = () => {
+    setRepositoryStatus(null);
   };
 
   return {
@@ -367,9 +418,12 @@ export function useAwsConfig() {
     metadata,
     transferStatus,
     setTransferStatus,
+    repositoryStatus,
+    clearRepositoryStatus,
     handleRoleLogin,
     handleSsoLogin,
     handleRefresh,
+    handleConnectRepository,
     handleDeploy,
     handleTerminate,
     handleConnect,

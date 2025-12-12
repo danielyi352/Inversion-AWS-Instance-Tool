@@ -72,6 +72,18 @@ export function fetchInstances(region: string = "us-east-1") {
   );
 }
 
+export function checkRepositoryStatus(repository: string, region: string = "us-east-1") {
+  // Session ID is automatically included via apiFetch
+  return apiFetch<{
+    exists: boolean;
+    hasImages: boolean;
+    imageCount: number;
+    images: Array<{imageTag: string; imageDigest: string}>;
+    repositoryUri?: string;
+    message: string;
+  }>(`/repositories/${encodeURIComponent(repository)}/status?region=${encodeURIComponent(region)}`);
+}
+
 export function deploy(config: AwsConfig & { accountId: string }) {
   // Session ID is automatically included via apiFetch
   return apiFetch<DeployResponse>("/deploy", {

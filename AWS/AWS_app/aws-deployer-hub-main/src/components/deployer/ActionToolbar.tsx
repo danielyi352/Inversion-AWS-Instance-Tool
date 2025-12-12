@@ -9,6 +9,7 @@ import { LogIn, RefreshCw, Rocket, Power, Terminal } from 'lucide-react';
 interface ActionToolbarProps {
   isLoggedIn: boolean;
   hasSelectedInstance: boolean;
+  repositoryHasImages?: boolean;
   onRoleLogin: () => void;
   onRefresh: () => void;
   onDeploy: () => void;
@@ -19,6 +20,7 @@ interface ActionToolbarProps {
 export function ActionToolbar({
   isLoggedIn,
   hasSelectedInstance,
+  repositoryHasImages = false,
   onRoleLogin,
   onRefresh,
   onDeploy,
@@ -64,7 +66,7 @@ export function ActionToolbar({
         <TooltipTrigger asChild>
           <Button
             onClick={onDeploy}
-            disabled={!isLoggedIn}
+            disabled={!isLoggedIn || !repositoryHasImages}
             className="gap-2"
           >
             <Rocket className="h-4 w-4" />
@@ -72,7 +74,11 @@ export function ActionToolbar({
           </Button>
         </TooltipTrigger>
         <TooltipContent>
-          <p>Launch a new EC2 instance using the selected ECR repository</p>
+          <p>
+            {!repositoryHasImages 
+              ? "Repository is empty. Please connect to a repository with images first."
+              : "Launch a new EC2 instance using the selected ECR repository"}
+          </p>
         </TooltipContent>
       </Tooltip>
 
