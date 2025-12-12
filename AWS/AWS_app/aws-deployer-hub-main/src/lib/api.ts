@@ -1,18 +1,44 @@
-import type { AwsConfig, AwsMetadata, DeployResponse, RunningInstance } from "@/types/aws";
+import type { AwsConfig, AwsMetadata, DeployResponse, RunningInstance, AssumeRoleLoginRequest, AssumeRoleLoginResponse } from "@/types/aws";
 
 // Use a fixed local API base to avoid proxy/env drift during development.
 const API_BASE = "http://127.0.0.1:8000/api";
 
+// Get session ID from localStorage
+function getSessionId(): string | null {
+  return localStorage.getItem('aws_session_id');
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(detail || res.statusText);
+  const sessionId = getSessionId();
+  const headers: HeadersInit = { "Content-Type": "application/json" };
+  
+  // Add session ID to headers if available
+  if (sessionId) {
+    headers["X-Session-ID"] = sessionId;
   }
-  return res.json();
+  
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers,
+      ...options,
+    });
+    
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(detail || res.statusText);
+    }
+    return res.json();
+  } catch (error) {
+    // Provide more helpful error messages
+    if (error instanceof TypeError && error.message === 'Failed to fetch') {
+      throw new Error(
+        `Cannot connect to backend server at ${API_BASE}. ` +
+        `Make sure the backend is running on port 8000. ` +
+        `Error: ${error.message}`
+      );
+    }
+    throw error;
+  }
 }
 
 export function loginSso(profile: string, region: string) {
@@ -22,21 +48,36 @@ export function loginSso(profile: string, region: string) {
   });
 }
 
-export function fetchMetadata(profile: string, region: string) {
-  return apiFetch<AwsMetadata>(`/metadata?profile=${encodeURIComponent(profile)}&region=${encodeURIComponent(region)}`);
+export function assumeRoleLogin(request: AssumeRoleLoginRequest) {
+  return apiFetch<AssumeRoleLoginResponse>("/auth/assume-role", {
+    method: "POST",
+    body: JSON.stringify({
+      role_arn: request.roleArn,
+      external_id: request.externalId,
+      region: request.region,
+      session_name: request.sessionName || "inversion-deployer-session",
+    }),
+  });
 }
 
-export function fetchInstances(profile: string, region: string) {
+export function fetchMetadata(region: string = "us-east-1") {
+  // Session ID is automatically included via apiFetch
+  return apiFetch<AwsMetadata>(`/metadata?region=${encodeURIComponent(region)}`);
+}
+
+export function fetchInstances(region: string = "us-east-1") {
+  // Session ID is automatically included via apiFetch
   return apiFetch<{ instances: RunningInstance[] }>(
-    `/instances?profile=${encodeURIComponent(profile)}&region=${encodeURIComponent(region)}`
+    `/instances?region=${encodeURIComponent(region)}`
   );
 }
 
 export function deploy(config: AwsConfig & { accountId: string }) {
+  // Session ID is automatically included via apiFetch
   return apiFetch<DeployResponse>("/deploy", {
     method: "POST",
     body: JSON.stringify({
-      profile: config.profile,
+      profile: config.profile || "",  // Optional for session-based auth
       region: config.region,
       account_id: config.accountId,
       repository: config.ecrRepository,
@@ -49,8 +90,9 @@ export function deploy(config: AwsConfig & { accountId: string }) {
 }
 
 export function deployStream(config: AwsConfig & { accountId: string }) {
+  const sessionId = getSessionId();
   const params = new URLSearchParams({
-    profile: config.profile,
+    profile: config.profile || "",  // Optional for session-based auth
     region: config.region,
     account_id: config.accountId,
     repository: config.ecrRepository,
@@ -59,27 +101,35 @@ export function deployStream(config: AwsConfig & { accountId: string }) {
     security_group: config.securityGroup,
     volume_size: String(config.volumeSize),
   });
+  
+  // EventSource doesn't support custom headers, so we'll pass session_id as a param
+  // Backend will need to handle this
+  if (sessionId) {
+    params.append('session_id', sessionId);
+  }
+  
   return new EventSource(`${API_BASE}/deploy/stream?${params.toString()}`);
 }
 
-export function terminate(profile: string, region: string, instanceId: string) {
+export function terminate(region: string, instanceId: string) {
+  // Session ID is automatically included via apiFetch
   return apiFetch<{ status: string }>("/terminate", {
     method: "POST",
-    body: JSON.stringify({ profile, region, instance_id: instanceId }),
+    body: JSON.stringify({ profile: "", region, instance_id: instanceId }),
   });
 }
 
 export function connect(
-  profile: string,
   region: string,
   instanceId: string,
   keyPath?: string,
   launchTerminal: boolean = true,
 ) {
+  // Session ID is automatically included via apiFetch
   return apiFetch<{ status: string; sshCommand: string; publicDns: string; launched?: boolean; launchError?: string }>("/connect", {
     method: "POST",
     body: JSON.stringify({
-      profile,
+      profile: "",
       region,
       instance_id: instanceId,
       key_path: keyPath,
@@ -89,17 +139,17 @@ export function connect(
 }
 
 export function uploadFile(
-  profile: string,
   region: string,
   instanceId: string,
   localPath: string,
   destinationPath: string,
   keyPath?: string,
 ) {
+  // Session ID is automatically included via apiFetch
   return apiFetch<{ status: string; message?: string }>("/upload", {
     method: "POST",
     body: JSON.stringify({
-      profile,
+      profile: "",
       region,
       instance_id: instanceId,
       local_path: localPath,
@@ -110,17 +160,17 @@ export function uploadFile(
 }
 
 export function downloadFile(
-  profile: string,
   region: string,
   instanceId: string,
   remotePath: string,
   localPath: string,
   keyPath?: string,
 ) {
+  // Session ID is automatically included via apiFetch
   return apiFetch<{ status: string; message?: string }>("/download", {
     method: "POST",
     body: JSON.stringify({
-      profile,
+      profile: "",
       region,
       instance_id: instanceId,
       remote_path: remotePath,

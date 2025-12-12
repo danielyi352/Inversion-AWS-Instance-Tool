@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import type { AwsConfig, RunningInstance, LogEntry, TransferStatus, AwsMetadata } from '@/types/aws';
-import { connect, deployStream, downloadFile, fetchInstances, fetchMetadata, loginSso, terminate, uploadFile } from '@/lib/api';
+import { assumeRoleLogin, connect, deployStream, downloadFile, fetchInstances, fetchMetadata, loginSso, terminate, uploadFile } from '@/lib/api';
 
 const STORAGE_KEY = 'inversion-deployer-config';
 
@@ -36,6 +36,20 @@ export function useAwsConfig() {
   });
   const [deploySource, setDeploySource] = useState<EventSource | null>(null);
 
+  // Check for existing session on load
+  useEffect(() => {
+    const sessionId = localStorage.getItem('aws_session_id');
+    if (sessionId) {
+      setIsLoggedIn(true);
+      // Try to refresh to verify session is still valid
+      handleRefresh().catch(() => {
+        // Session expired, clear it
+        localStorage.removeItem('aws_session_id');
+        setIsLoggedIn(false);
+      });
+    }
+  }, []);
+
   // Load saved settings
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -68,6 +82,52 @@ export function useAwsConfig() {
 
   const clearLogs = () => setLogs([]);
 
+  const handleRoleLogin = async (roleArn: string, externalId: string, region: string) => {
+    try {
+      addLog('Logging in with IAM Role ARN...', 'info');
+      setProgress(15);
+      const response = await assumeRoleLogin({
+        roleArn,
+        externalId: externalId || undefined,
+        region,
+      });
+      
+      // Store session ID
+      localStorage.setItem('aws_session_id', response.session_id);
+      
+      // Update config with account ID and region from response
+      updateConfig({ 
+        accountId: response.account_id,
+        region: region 
+      });
+      
+      // Save account ID to config for future use
+      if (rememberSettings) {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          try {
+            const parsed = JSON.parse(saved);
+            parsed.config = { ...parsed.config, accountId: response.account_id, region: region };
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+      
+      setProgress(60);
+      setIsLoggedIn(true);
+      addLog(`Login successful! Connected to account ${response.account_id}`, 'success');
+      setProgress(100);
+      await handleRefresh();
+    } catch (err) {
+      addLog(`Login failed: ${String(err)}`, 'error');
+      throw err; // Re-throw so dialog can show error
+    } finally {
+      setTimeout(() => setProgress(0), 500);
+    }
+  };
+
   const handleSsoLogin = async () => {
     try {
       addLog('Initiating AWS SSO login...', 'info');
@@ -86,17 +146,37 @@ export function useAwsConfig() {
 
   const handleRefresh = async () => {
     try {
+      // Check if we have a session ID
+      const sessionId = localStorage.getItem('aws_session_id');
+      if (!sessionId) {
+        addLog('Not logged in. Please login first.', 'error');
+        setIsLoggedIn(false);
+        return;
+      }
+      
       addLog('Refreshing AWS data...', 'info');
       setProgress(20);
-      const meta = await fetchMetadata(config.profile || 'default', config.region);
+      const meta = await fetchMetadata(config.region);
       setMetadata(meta);
       setProgress(50);
-      const { instances: running } = await fetchInstances(config.profile || 'default', config.region);
+      const { instances: running } = await fetchInstances(config.region);
       setInstances(running);
       addLog('AWS data refreshed', 'success');
       setProgress(100);
     } catch (err) {
-      addLog(`Refresh failed: ${String(err)}`, 'error');
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      addLog(`Refresh failed: ${errorMessage}`, 'error');
+      
+      // Check for specific error types
+      if (errorMessage.includes('Cannot connect to backend')) {
+        addLog('Backend server is not running. Please start it and try again.', 'error');
+      } else if (errorMessage.includes('Session expired') || errorMessage.includes('Invalid or expired session')) {
+        addLog('Session expired. Please login again.', 'error');
+        localStorage.removeItem('aws_session_id');
+        setIsLoggedIn(false);
+      } else if (errorMessage.includes('Failed to fetch')) {
+        addLog('Cannot reach backend server. Is it running on port 8000?', 'error');
+      }
     } finally {
       setTimeout(() => setProgress(0), 400);
     }
@@ -104,7 +184,7 @@ export function useAwsConfig() {
 
   const handleDeploy = async () => {
     if (!isLoggedIn) {
-      addLog('Please log in via AWS SSO first', 'error');
+      addLog('Please log in first', 'error');
       return;
     }
     if (deploySource) {
@@ -178,7 +258,7 @@ export function useAwsConfig() {
     try {
       addLog(`Terminating instance ${selectedInstance}...`, 'warning');
       setProgress(40);
-      await terminate(config.profile || 'default', config.region, selectedInstance);
+      await terminate(config.region, selectedInstance);
       setInstances(prev => prev.filter(i => i.id !== selectedInstance));
       setSelectedInstance(null);
       setProgress(100);
@@ -198,7 +278,7 @@ export function useAwsConfig() {
     const derivedKeyPath =
       config.keyPair ? `~/.ssh/${config.keyPair}.pem` : undefined;
 
-    connect(config.profile || 'default', config.region, selectedInstance, derivedKeyPath)
+    connect(config.region, selectedInstance, derivedKeyPath)
       .then(resp => {
         addLog('SSH command:', 'info');
         addLog(resp.sshCommand, 'success');
@@ -220,7 +300,6 @@ export function useAwsConfig() {
       setTransferStatus(prev => ({ ...prev, isUploading: true, currentFile: file }));
       addLog(`Uploading ${file} -> ${destination}`, 'info');
       const resp = await uploadFile(
-        config.profile || 'default',
         config.region,
         selectedInstance,
         file,
@@ -243,7 +322,6 @@ export function useAwsConfig() {
       setTransferStatus(prev => ({ ...prev, isDownloading: true, currentFile: remotePath }));
       addLog(`Downloading ${remotePath} -> ${localPath || 'local destination'}`, 'info');
       const resp = await downloadFile(
-        config.profile || 'default',
         config.region,
         selectedInstance,
         remotePath,
@@ -273,6 +351,7 @@ export function useAwsConfig() {
     metadata,
     transferStatus,
     setTransferStatus,
+    handleRoleLogin,
     handleSsoLogin,
     handleRefresh,
     handleDeploy,

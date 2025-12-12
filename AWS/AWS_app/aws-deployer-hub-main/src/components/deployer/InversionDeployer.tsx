@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
 import { useAwsConfig } from '@/hooks/useAwsConfig';
@@ -6,8 +7,11 @@ import { StatusCard } from './StatusCard';
 import { ActionToolbar } from './ActionToolbar';
 import { ProgressLogArea } from './ProgressLogArea';
 import { FileTransferSection } from './FileTransferSection';
+import { RoleLoginDialog } from './RoleLoginDialog';
 
 export function InversionDeployer() {
+  const [loginDialogOpen, setLoginDialogOpen] = useState(false);
+  
   const {
     config,
     updateConfig,
@@ -21,7 +25,7 @@ export function InversionDeployer() {
     clearLogs,
     progress,
     metadata,
-    handleSsoLogin,
+    handleRoleLogin,
     handleRefresh,
     handleDeploy,
     handleTerminate,
@@ -85,11 +89,18 @@ export function InversionDeployer() {
           <ActionToolbar
             isLoggedIn={isLoggedIn}
             hasSelectedInstance={!!selectedInstance}
-            onSsoLogin={handleSsoLogin}
+            onRoleLogin={() => setLoginDialogOpen(true)}
             onRefresh={handleRefresh}
             onDeploy={handleDeploy}
             onTerminate={handleTerminate}
             onConnect={handleConnect}
+          />
+
+          {/* Login Dialog */}
+          <RoleLoginDialog
+            open={loginDialogOpen}
+            onOpenChange={setLoginDialogOpen}
+            onLogin={handleRoleLogin}
           />
 
           {/* Progress & Logs */}

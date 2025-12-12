@@ -9,7 +9,7 @@ import { LogIn, RefreshCw, Rocket, Power, Terminal } from 'lucide-react';
 interface ActionToolbarProps {
   isLoggedIn: boolean;
   hasSelectedInstance: boolean;
-  onSsoLogin: () => void;
+  onRoleLogin: () => void;
   onRefresh: () => void;
   onDeploy: () => void;
   onTerminate: () => void;
@@ -19,7 +19,7 @@ interface ActionToolbarProps {
 export function ActionToolbar({
   isLoggedIn,
   hasSelectedInstance,
-  onSsoLogin,
+  onRoleLogin,
   onRefresh,
   onDeploy,
   onTerminate,
@@ -31,16 +31,16 @@ export function ActionToolbar({
         <TooltipTrigger asChild>
           <Button
             variant="outline"
-            onClick={onSsoLogin}
+            onClick={onRoleLogin}
             disabled={isLoggedIn}
             className="gap-2 border-border/60 bg-card hover:bg-muted"
           >
             <LogIn className="h-4 w-4" />
-            AWS SSO Login
+            Login with ARN
           </Button>
         </TooltipTrigger>
         <TooltipContent>
-          <p>Authenticate via AWS SSO to access your account</p>
+          <p>Login using your IAM Role ARN</p>
         </TooltipContent>
       </Tooltip>
 

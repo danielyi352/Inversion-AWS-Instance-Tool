@@ -57,6 +57,21 @@ export interface DeployStreamEvent {
   data: unknown;
 }
 
+export interface AssumeRoleLoginRequest {
+  roleArn: string;
+  externalId?: string;
+  region: string;
+  sessionName?: string;
+}
+
+export interface AssumeRoleLoginResponse {
+  status: string;
+  session_id: string;
+  expires_at: string;
+  account_id: string;
+  message: string;
+}
+
 export const AWS_REGIONS = [
   { value: 'us-east-1', label: 'US East (N. Virginia)' },
   { value: 'us-east-2', label: 'US East (Ohio)' },

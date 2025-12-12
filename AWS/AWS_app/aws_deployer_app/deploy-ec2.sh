@@ -142,9 +142,21 @@ check_aws_cli() {
   if ! command -v aws &> /dev/null; then
     error_exit "AWS CLI is not installed."
   fi
-  check_sso_login
-  get_sso_credentials
-  log "AWS CLI and SSO check passed"
+  
+  # Check if we have credentials from environment variables (assumed role)
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] && [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
+    log "Using provided AWS credentials (assumed role)"
+    # Verify credentials work
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+      error_exit "Provided AWS credentials are invalid or expired"
+    fi
+    log "AWS credentials verified"
+  else
+    # Fall back to SSO login (legacy)
+    check_sso_login
+    get_sso_credentials
+  fi
+  log "AWS CLI check passed"
 }
 
 check_key_pair() {

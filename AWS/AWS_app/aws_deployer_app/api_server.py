@@ -10,15 +10,21 @@ import os
 import subprocess
 import sys
 import shlex
+import uuid
+import time
+import base64
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Generator
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+import paramiko
 
 # ------------------------------------------------------------------------------
 # FastAPI setup
@@ -46,13 +52,20 @@ class LoginRequest(BaseModel):
     region: str = Field(default="us-east-1")
 
 
+class AssumeRoleLoginRequest(BaseModel):
+    role_arn: str = Field(..., description="IAM Role ARN to assume")
+    external_id: Optional[str] = Field(None, description="External ID for security (optional)")
+    region: str = Field(default="us-east-1")
+    session_name: str = Field(default="inversion-deployer-session")
+
+
 class DeployRequestModel(BaseModel):
     profile: str
     region: str
     account_id: str
     repository: str
     instance_type: str
-    key_pair: str
+    key_pair: Optional[str] = Field(None, description="EC2 key pair name (optional, only needed for manual SSH access)")
     security_group: str
     volume_size: int = Field(default=30, ge=1, le=2048)
 
@@ -78,8 +91,7 @@ class UploadRequest(BaseModel):
     instance_id: str
     local_path: str
     destination_path: str
-    ssh_user: str = Field(default="ubuntu")
-    key_path: Optional[str] = None
+    container_name: Optional[str] = Field(None, description="Container name if uploading to container")
 
 
 class DownloadRequest(BaseModel):
@@ -88,8 +100,138 @@ class DownloadRequest(BaseModel):
     instance_id: str
     remote_path: str
     local_path: str
-    ssh_user: str = Field(default="ubuntu")
-    key_path: Optional[str] = None
+    container_name: Optional[str] = Field(None, description="Container name if downloading from container")
+
+
+# ------------------------------------------------------------------------------
+# Session Management
+# ------------------------------------------------------------------------------
+
+# In-memory session storage (use Redis/database in production)
+sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_your_aws_credentials():
+    """
+    Get your AWS account credentials for assuming roles.
+    
+    Tries multiple secure methods in order:
+    1. Environment variables (YOUR_AWS_ACCESS_KEY_ID, YOUR_AWS_SECRET_ACCESS_KEY)
+    2. AWS Secrets Manager (if SECRET_NAME env var is set)
+    3. AWS Systems Manager Parameter Store (if PARAMETER_NAME env var is set)
+    4. .env file (for development, requires python-dotenv)
+    
+    Returns:
+        Tuple[str, str]: (access_key_id, secret_access_key)
+    
+    Raises:
+        HTTPException: If credentials cannot be found
+    """
+    access_key = None
+    secret_key = None
+    
+    # Method 1: Environment variables (highest priority)
+    access_key = os.environ.get("YOUR_AWS_ACCESS_KEY_ID")
+    secret_key = os.environ.get("YOUR_AWS_SECRET_ACCESS_KEY")
+    
+    if access_key and secret_key:
+        return access_key, secret_key
+    
+    # Method 2: AWS Secrets Manager
+    secret_name = os.environ.get("AWS_SECRET_NAME")
+    if secret_name:
+        try:
+            import json
+            secrets_client = boto3.client('secretsmanager')
+            response = secrets_client.get_secret_value(SecretId=secret_name)
+            secret_data = json.loads(response['SecretString'])
+            access_key = secret_data.get('YOUR_AWS_ACCESS_KEY_ID') or secret_data.get('access_key_id')
+            secret_key = secret_data.get('YOUR_AWS_SECRET_ACCESS_KEY') or secret_data.get('secret_access_key')
+            if access_key and secret_key:
+                return access_key, secret_key
+        except Exception as e:
+            # Log but continue to next method
+            print(f"Warning: Failed to get credentials from Secrets Manager: {e}")
+    
+    # Method 3: AWS Systems Manager Parameter Store
+    param_name = os.environ.get("AWS_PARAMETER_NAME")
+    if param_name:
+        try:
+            import json
+            ssm_client = boto3.client('ssm')
+            response = ssm_client.get_parameter(Name=param_name, WithDecryption=True)
+            param_data = json.loads(response['Parameter']['Value'])
+            access_key = param_data.get('YOUR_AWS_ACCESS_KEY_ID') or param_data.get('access_key_id')
+            secret_key = param_data.get('YOUR_AWS_SECRET_ACCESS_KEY') or param_data.get('secret_access_key')
+            if access_key and secret_key:
+                return access_key, secret_key
+        except Exception as e:
+            # Log but continue to next method
+            print(f"Warning: Failed to get credentials from Parameter Store: {e}")
+    
+    # Method 4: .env file (for development)
+    try:
+        from dotenv import load_dotenv
+        # Load .env file if it exists
+        env_path = Path(__file__).parent.parent / '.env'
+        if env_path.exists():
+            load_dotenv(env_path)
+            access_key = os.environ.get("YOUR_AWS_ACCESS_KEY_ID")
+            secret_key = os.environ.get("YOUR_AWS_SECRET_ACCESS_KEY")
+            if access_key and secret_key:
+                return access_key, secret_key
+    except ImportError:
+        # python-dotenv not installed, skip
+        pass
+    except Exception as e:
+        print(f"Warning: Failed to load .env file: {e}")
+    
+    # If we get here, no credentials were found
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            "Server configuration error: AWS credentials not configured.\n"
+            "Please set credentials using one of these methods:\n"
+            "1. Environment variables: YOUR_AWS_ACCESS_KEY_ID and YOUR_AWS_SECRET_ACCESS_KEY\n"
+            "2. AWS Secrets Manager: Set AWS_SECRET_NAME environment variable\n"
+            "3. AWS Parameter Store: Set AWS_PARAMETER_NAME environment variable\n"
+            "4. .env file: Create .env file in project root (requires python-dotenv)"
+        )
+    )
+
+
+def _get_session_credentials(session_id: Optional[str]) -> Dict[str, Any]:
+    """Get credentials from session, raise error if invalid/expired."""
+    if not session_id:
+        raise HTTPException(status_code=401, detail="No session ID provided")
+    
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    expiration = datetime.fromisoformat(session['expiration'])
+    # Use timezone-aware datetime for comparison (AWS returns UTC timestamps)
+    now = datetime.now(timezone.utc)
+    # Ensure expiration is timezone-aware (if it's not already)
+    if expiration.tzinfo is None:
+        expiration = expiration.replace(tzinfo=timezone.utc)
+    
+    if expiration < now:
+        # Clean up expired session
+        sessions.pop(session_id, None)
+        raise HTTPException(status_code=401, detail="Session expired. Please login again.")
+    
+    return session
+
+
+def _session_from_credentials(credentials: Dict[str, Any], region: str):
+    """Create boto3 session from stored credentials."""
+    return boto3.Session(
+        aws_access_key_id=credentials['access_key_id'],
+        aws_secret_access_key=credentials['secret_access_key'],
+        aws_session_token=credentials['session_token'],
+        region_name=region
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -115,6 +257,7 @@ AwsMilestones = (
 
 
 def _session(profile: str, region: str):
+    """Legacy session creation using profile (for backward compatibility)."""
     try:
         return boto3.Session(profile_name=profile, region_name=region)
     except (BotoCoreError, NoCredentialsError) as exc:  # pragma: no cover
@@ -130,90 +273,696 @@ def _run(cmd: List[str], env: Optional[Dict[str, str]] = None) -> str:
         raise HTTPException(status_code=500, detail=exc.output) from exc
 
 
-def _script_path() -> Path:
-    base = Path(getattr(sys, "_MEIPASS", Path.cwd()))
-    candidate = base / "deploy-ec2.sh"
-    if candidate.exists():
-        return candidate
-    fallback = Path(__file__).resolve().parent / "deploy-ec2.sh"
-    if fallback.exists():
-        return fallback
-    raise HTTPException(status_code=500, detail="deploy-ec2.sh not found.")
+# ------------------------------------------------------------------------------
+# New boto3-based deployment functions (no AWS CLI required)
+# ------------------------------------------------------------------------------
+
+def _log_message(message: str) -> str:
+    """Format log message with timestamp."""
+    return f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} - {message}"
 
 
-def _run_deploy_script(req: DeployRequestModel) -> Dict[str, Any]:
-    env = os.environ.copy() | {
-        "AWS_REGION": req.region,
-        "AWS_ACCOUNT_ID": req.account_id,
-        "ECR_REPOSITORY": req.repository,
-        "INSTANCE_TYPE": req.instance_type,
-        "KEY_PAIR_NAME": req.key_pair,
-        "SECURITY_GROUP_NAME": req.security_group,
-        "VOLUME_SIZE": str(req.volume_size),
-        "AWS_PROFILE": req.profile,
-        "SSO_SESSION": req.profile,
+def _ensure_iam_role(iam_client, role_name: str, account_id: str, log_callback=None) -> str:
+    """Ensure IAM role exists with SSM and S3 permissions. Returns role ARN."""
+    if log_callback:
+        log_callback(_log_message(f"Checking IAM role: {role_name}"))
+    
+    try:
+        # Check if role exists
+        role = iam_client.get_role(RoleName=role_name)
+        role_arn = role['Role']['Arn']
+        
+        # Verify instance profile exists
+        try:
+            profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
+            if log_callback:
+                log_callback(_log_message(f"IAM role {role_name} and instance profile already exist"))
+        except ClientError:
+            # Role exists but instance profile doesn't - create it
+            if log_callback:
+                log_callback(_log_message(f"Creating instance profile for existing role: {role_name}"))
+            try:
+                iam_client.create_instance_profile(InstanceProfileName=role_name)
+            except ClientError as profile_err:
+                if profile_err.response['Error']['Code'] != 'EntityAlreadyExists':
+                    raise
+            
+            # Attach role to instance profile
+            try:
+                profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
+                roles = [r['RoleName'] for r in profile['InstanceProfile']['Roles']]
+                if role_name not in roles:
+                    iam_client.add_role_to_instance_profile(
+                        InstanceProfileName=role_name,
+                        RoleName=role_name
+                    )
+            except ClientError as add_err:
+                if add_err.response['Error']['Code'] not in ['LimitExceeded', 'EntityAlreadyExists']:
+                    raise
+            
+            # Wait for instance profile to be ready
+            for attempt in range(10):
+                try:
+                    profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
+                    if profile['InstanceProfile']['Roles']:
+                        break
+                except ClientError:
+                    pass
+                time.sleep(1)
+        
+        return role_arn
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchEntity':
+            # Role doesn't exist, create it
+            if log_callback:
+                log_callback(_log_message(f"Creating IAM role: {role_name}"))
+            
+            # Trust policy for EC2
+            trust_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Service": "ec2.amazonaws.com"
+                        },
+                        "Action": "sts:AssumeRole"
+                    }
+                ]
+            }
+            
+            # Create role
+            role = iam_client.create_role(
+                RoleName=role_name,
+                AssumeRolePolicyDocument=json.dumps(trust_policy),
+                Description="IAM role for Inversion Deployer EC2 instances with SSM and S3 access"
+            )
+            role_arn = role['Role']['Arn']
+            
+            # Attach AWS managed policies for SSM
+            iam_client.attach_role_policy(
+                RoleName=role_name,
+                PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+            )
+            
+            # Create and attach S3 policy
+            s3_policy = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:PutObject",
+                            "s3:GetObject",
+                            "s3:DeleteObject"
+                        ],
+                        "Resource": f"arn:aws:s3:::inversion-deployer-temp-{account_id}/*"
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:ListBucket",
+                            "s3:GetBucketLocation"
+                        ],
+                        "Resource": f"arn:aws:s3:::inversion-deployer-temp-{account_id}"
+                    }
+                ]
+            }
+            
+            iam_client.put_role_policy(
+                RoleName=role_name,
+                PolicyName=f"{role_name}-S3Policy",
+                PolicyDocument=json.dumps(s3_policy)
+            )
+            
+            # Create instance profile and attach role
+            profile_created = False
+            try:
+                iam_client.create_instance_profile(InstanceProfileName=role_name)
+                profile_created = True
+            except ClientError as profile_err:
+                if profile_err.response['Error']['Code'] != 'EntityAlreadyExists':
+                    raise
+            
+            # Check if role is already attached to instance profile
+            try:
+                profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
+                roles = [r['RoleName'] for r in profile['InstanceProfile']['Roles']]
+                if role_name not in roles:
+                    iam_client.add_role_to_instance_profile(
+                        InstanceProfileName=role_name,
+                        RoleName=role_name
+                    )
+            except ClientError as add_err:
+                if add_err.response['Error']['Code'] not in ['LimitExceeded', 'EntityAlreadyExists']:
+                    raise
+            
+            if log_callback:
+                log_callback(_log_message(f"IAM role {role_name} created with SSM and S3 permissions"))
+            
+            # Wait for instance profile to be available (IAM can take a few seconds to propagate)
+            if profile_created:
+                if log_callback:
+                    log_callback(_log_message("Waiting for instance profile to be available..."))
+                for attempt in range(10):  # Wait up to 10 seconds
+                    try:
+                        profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
+                        if profile['InstanceProfile']['Roles']:
+                            if log_callback:
+                                log_callback(_log_message("Instance profile is ready"))
+                            break
+                    except ClientError:
+                        pass
+                    time.sleep(1)
+            
+            return role_arn
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to check IAM role: {e}")
+
+
+def _ensure_key_pair(ec2_client, key_pair_name: str, region: str, log_callback=None) -> Optional[str]:
+    """Check if key pair exists, create if not. Returns path to key file or None."""
+    try:
+        # Check if key pair exists
+        ec2_client.describe_key_pairs(KeyNames=[key_pair_name])
+        if log_callback:
+            log_callback(_log_message(f"Key pair {key_pair_name} already exists in AWS"))
+        # Try to find local key file in multiple locations
+        possible_paths = [
+            os.path.expanduser(f"~/.ssh/{key_pair_name}.pem"),
+            os.path.expanduser(f"~/.ssh/{key_pair_name}"),
+            os.path.join(os.path.expanduser("~"), key_pair_name + ".pem"),
+        ]
+        
+        for key_path in possible_paths:
+            if os.path.exists(key_path):
+                if log_callback:
+                    log_callback(_log_message(f"Found SSH key at {key_path}"))
+                return key_path
+        
+        # Key exists in AWS but not locally - this is a problem
+        if log_callback:
+            log_callback(_log_message(f"[ERROR] Key pair {key_pair_name} exists in AWS but local key file not found"))
+            log_callback(_log_message(f"[ERROR] Please ensure the key file exists at ~/.ssh/{key_pair_name}.pem"))
+            log_callback(_log_message(f"[ERROR] Or delete the key pair in AWS and let the system create a new one"))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Key pair '{key_pair_name}' exists in AWS but local key file not found. "
+                f"Please either:\n"
+                f"1. Place your key file at ~/.ssh/{key_pair_name}.pem\n"
+                f"2. Or delete the key pair in AWS Console and let the system create a new one"
+            )
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidKeyPair.NotFound':
+            # Create key pair
+            try:
+                response = ec2_client.create_key_pair(KeyName=key_pair_name)
+                key_material = response['KeyMaterial']
+                
+                # Save to ~/.ssh/
+                ssh_dir = os.path.expanduser("~/.ssh")
+                os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+                key_path = os.path.join(ssh_dir, f"{key_pair_name}.pem")
+                
+                with open(key_path, 'w', encoding='utf-8') as f:
+                    f.write(key_material)
+                os.chmod(key_path, 0o600)
+                
+                if log_callback:
+                    log_callback(_log_message(f"Key pair {key_pair_name} created and saved to {key_path}"))
+                return key_path
+            except Exception as exc:
+                if log_callback:
+                    log_callback(_log_message(f"[ERROR] Failed to create key pair: {exc}"))
+                raise HTTPException(status_code=500, detail=f"Failed to create key pair: {exc}")
+        else:
+            raise
+
+
+def _get_latest_ami(ec2_client, ssm_client, repository: str, region: str, log_callback=None) -> tuple:
+    """Get latest AMI ID and root device name. Returns (ami_id, root_device_name)."""
+    # Detect GPU vs CPU based on repository name
+    repo_lower = repository.lower()
+    target_gpu = 0 if 'cpu' in repo_lower else 1
+    
+    if target_gpu == 1:
+        # GPU AMI
+        if log_callback:
+            log_callback(_log_message("Finding latest Amazon Linux Deep Learning Base OSS Nvidia Driver GPU AMI (x86_64)..."))
+        try:
+            response = ec2_client.describe_images(
+                Owners=['amazon'],
+                Filters=[
+                    {'Name': 'name', 'Values': ['Deep Learning Base OSS Nvidia Driver GPU AMI (Amazon Linux 2023)*']},
+                    {'Name': 'state', 'Values': ['available']},
+                    {'Name': 'architecture', 'Values': ['x86_64']}
+                ]
+            )
+            images = sorted(response['Images'], key=lambda x: x['CreationDate'], reverse=True)
+            if not images:
+                raise HTTPException(status_code=500, detail="Could not find GPU AMI")
+            ami_id = images[0]['ImageId']
+        except ClientError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to find GPU AMI: {e}")
+    else:
+        # CPU AMI
+        if log_callback:
+            log_callback(_log_message("Finding latest Amazon Linux 2023 AMI (x86_64)..."))
+        try:
+            response = ssm_client.get_parameters(
+                Names=['/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64']
+            )
+            if not response['Parameters']:
+                raise HTTPException(status_code=500, detail="Could not retrieve Amazon Linux 2023 AMI via SSM")
+            ami_id = response['Parameters'][0]['Value']
+        except ClientError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to get CPU AMI: {e}")
+    
+    # Get root device name
+    try:
+        response = ec2_client.describe_images(ImageIds=[ami_id])
+        root_device_name = response['Images'][0]['RootDeviceName']
+        if log_callback:
+            log_callback(_log_message(f"Using AMI: {ami_id} (root device: {root_device_name})"))
+        return ami_id, root_device_name
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get AMI details: {e}")
+
+
+def _ensure_security_group(ec2_client, security_group_name: str, repository: str, region: str, log_callback=None) -> str:
+    """Ensure security group exists and has SSH access. Returns security group ID."""
+    try:
+        # Check if security group exists
+        response = ec2_client.describe_security_groups(GroupNames=[security_group_name])
+        sg_id = response['SecurityGroups'][0]['GroupId']
+        if log_callback:
+            log_callback(_log_message(f"Security group {security_group_name} already exists ({sg_id})"))
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidGroup.NotFound':
+            # Create security group
+            try:
+                response = ec2_client.create_security_group(
+                    GroupName=security_group_name,
+                    Description=f"Security group for {repository} Docker container"
+                )
+                sg_id = response['GroupId']
+                if log_callback:
+                    log_callback(_log_message(f"Created security group: {sg_id}"))
+            except ClientError as create_err:
+                raise HTTPException(status_code=500, detail=f"Failed to create security group: {create_err}")
+        else:
+            raise
+    
+    # Check if SSH rule exists
+    try:
+        response = ec2_client.describe_security_groups(GroupIds=[sg_id])
+        sg = response['SecurityGroups'][0]
+        has_ssh = False
+        for perm in sg.get('IpPermissions', []):
+            if perm.get('IpProtocol') == 'tcp' and perm.get('FromPort') == 22:
+                for ip_range in perm.get('IpRanges', []):
+                    if ip_range.get('CidrIp') == '0.0.0.0/0':
+                        has_ssh = True
+                        break
+                if has_ssh:
+                    break
+        
+        if not has_ssh:
+            try:
+                ec2_client.authorize_security_group_ingress(
+                    GroupId=sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp',
+                        'FromPort': 22,
+                        'ToPort': 22,
+                        'IpRanges': [{'CidrIp': '0.0.0.0/0', 'Description': 'SSH access'}]
+                    }]
+                )
+                if log_callback:
+                    log_callback(_log_message(f"Authorized SSH ingress (tcp/22 0.0.0.0/0) on {security_group_name}"))
+            except ClientError as auth_err:
+                if auth_err.response['Error']['Code'] != 'InvalidPermission.Duplicate':
+                    raise HTTPException(status_code=500, detail=f"Failed to authorize SSH access: {auth_err}")
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to check security group rules: {e}")
+    
+    return sg_id
+
+
+def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str, key_pair_name: Optional[str],
+                        security_group_name: str, root_device_name: str, volume_size: int,
+                        repository: str, account_id: str, region: str, log_callback=None) -> tuple:
+    """Launch EC2 instance and wait for it to be running. Returns (instance_id, public_dns)."""
+    if log_callback:
+        log_callback(_log_message("Launching EC2 instance..."))
+    
+    container_name = f"{account_id}-{repository}-container"
+    
+    # Ensure IAM role exists for SSM and S3 access
+    role_name = f"inversion-deployer-instance-role-{account_id}"
+    _ensure_iam_role(iam_client, role_name, account_id, log_callback)
+    
+    # Get instance profile ARN (more reliable than name)
+    try:
+        profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
+        instance_profile_arn = profile['InstanceProfile']['Arn']
+    except ClientError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get instance profile: {e}. Please ensure the instance profile exists."
+        )
+    
+    # Build run_instances parameters
+    run_params = {
+        'ImageId': ami_id,
+        'InstanceType': instance_type,
+        'SecurityGroups': [security_group_name],
+        'IamInstanceProfile': {'Arn': instance_profile_arn},
+        'BlockDeviceMappings': [{
+            'DeviceName': root_device_name,
+            'Ebs': {
+                'VolumeSize': volume_size,
+                'VolumeType': 'gp3'
+            }
+        }],
+        'TagSpecifications': [{
+            'ResourceType': 'instance',
+            'Tags': [
+                {'Key': 'Name', 'Value': container_name},
+                {'Key': 'Project', 'Value': repository}
+            ]
+        }],
+        'MinCount': 1,
+        'MaxCount': 1
     }
+    
+    # Key pair is optional (only needed for manual SSH access)
+    if key_pair_name:
+        run_params['KeyName'] = key_pair_name
+    
+    try:
+        response = ec2_client.run_instances(**run_params)
+        
+        instance_id = response['Instances'][0]['InstanceId']
+        if log_callback:
+            log_callback(_log_message(f"Instance launched: {instance_id}"))
+        
+        # Wait for instance to be running
+        if log_callback:
+            log_callback(_log_message("Waiting for instance to be running..."))
+        waiter = ec2_client.get_waiter('instance_running')
+        waiter.wait(InstanceIds=[instance_id], WaiterConfig={'Delay': 5, 'MaxAttempts': 60})
+        
+        # Get public DNS
+        response = ec2_client.describe_instances(InstanceIds=[instance_id])
+        public_dns = response['Reservations'][0]['Instances'][0].get('PublicDnsName', '')
+        
+        if not public_dns:
+            # Instance might not have public DNS yet, wait a bit more
+            time.sleep(10)
+            response = ec2_client.describe_instances(InstanceIds=[instance_id])
+            public_dns = response['Reservations'][0]['Instances'][0].get('PublicDnsName', '')
+        
+        if log_callback:
+            log_callback(_log_message(f"Instance is running. Public DNS: {public_dns}"))
+        
+        return instance_id, public_dns
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to launch instance: {e}")
 
-    process = subprocess.Popen(
-        ["bash", str(_script_path())],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
+
+def _wait_for_ssm(ssm_client, instance_id: str, log_callback=None, max_retries: int = 30) -> None:
+    """Wait for SSM to be available on the instance."""
+    if log_callback:
+        log_callback(_log_message(f"Waiting for SSM agent to be ready on {instance_id}..."))
+    
+    for attempt in range(max_retries):
+        try:
+            if log_callback and attempt > 0 and attempt % 3 == 0:  # Log every 3rd attempt
+                log_callback(_log_message(f"SSM connection attempt {attempt + 1}/{max_retries}..."))
+            
+            # Try to send a simple command via SSM
+            response = ssm_client.send_command(
+                InstanceIds=[instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={'commands': ['echo ok']}
+            )
+            command_id = response['Command']['CommandId']
+            
+            # Wait a moment and check if command succeeded
+            time.sleep(2)
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id
+            )
+            
+            if result['Status'] == 'Success':
+                if log_callback:
+                    log_callback(_log_message("SSM connection established"))
+                return
+            elif result['Status'] == 'Failed':
+                # SSM is responding but command failed - that's okay, SSM is ready
+                if log_callback:
+                    log_callback(_log_message("SSM connection established"))
+                return
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code in ['InvalidInstanceId', 'InstanceNotInPreregisteredState']:
+                # Instance not ready for SSM yet
+                if log_callback and attempt % 3 == 0:
+                    log_callback(_log_message(f"SSM not ready yet (attempt {attempt + 1}/{max_retries})..."))
+            else:
+                if log_callback and attempt % 3 == 0:
+                    log_callback(_log_message(f"SSM connection attempt {attempt + 1} failed: {error_code}"))
+        except Exception as e:
+            if log_callback and attempt % 3 == 0:
+                log_callback(_log_message(f"SSM connection attempt {attempt + 1} failed: {type(e).__name__}"))
+        
+        if attempt < max_retries - 1:
+            time.sleep(10)
+    
+    raise HTTPException(
+        status_code=500, 
+        detail=f"SSM connection failed after {max_retries * 10} seconds. Instance may still be initializing. Ensure the instance has an IAM role with SSM permissions."
     )
 
+
+def _run_ssm_command(ssm_client, instance_id: str, command: str, log_callback=None, timeout: int = 300) -> tuple:
+    """Run a command on instance via SSM. Returns (success: bool, output: str, error: str)."""
+    try:
+        response = ssm_client.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={'commands': [command]}
+        )
+        command_id = response['Command']['CommandId']
+        
+        # Wait for command to complete
+        for _ in range(timeout // 10):  # Check every 10 seconds
+            time.sleep(10)
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id
+            )
+            status = result['Status']
+            if status in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
+                output = result.get('StandardOutputContent', '')
+                error = result.get('StandardErrorContent', '')
+                return (status == 'Success', output, error)
+        
+        return (False, '', 'Command timed out')
+    except Exception as e:
+        if log_callback:
+            log_callback(_log_message(f"SSM command failed: {str(e)}"))
+        return (False, '', str(e))
+
+
+def _install_docker_on_instance(ssm_client, instance_id: str, log_callback=None):
+    """Install Docker and prerequisites on EC2 instance via SSM."""
+    if log_callback:
+        log_callback(_log_message("Installing Docker and prerequisites on EC2 instance (Amazon Linux 2023)..."))
+    
+    setup_command = """sudo yum update -y && \
+sudo amazon-linux-extras install docker -y || sudo yum install -y docker && \
+sudo systemctl enable docker && \
+sudo systemctl start docker && \
+sudo usermod -aG docker ec2-user && \
+sudo yum install -y unzip || sudo dnf install -y unzip && \
+if ! command -v aws &> /dev/null; then \
+  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+  unzip awscliv2.zip && \
+  sudo ./aws/install; \
+fi && \
+sudo systemctl enable amazon-ssm-agent || true && \
+sudo systemctl start amazon-ssm-agent || true && \
+mkdir -p /home/ec2-user/simulations && \
+echo "Docker and AWS CLI installation completed"
+"""
+    
+    success, output, error = _run_ssm_command(ssm_client, instance_id, setup_command, log_callback, timeout=600)
+    
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Docker installation failed: {error or output}")
+    
+    if log_callback:
+        log_callback(_log_message("Docker installation completed"))
+
+
+def _configure_aws_on_instance(ssm_client, instance_id: str, access_key: str, secret_key: str,
+                               session_token: str, region: str, log_callback=None):
+    """Configure AWS credentials on EC2 instance via SSM."""
+    if log_callback:
+        log_callback(_log_message("Configuring AWS credentials on instance..."))
+    
+    # Escape special characters for shell
+    import shlex
+    access_key_escaped = shlex.quote(access_key)
+    secret_key_escaped = shlex.quote(secret_key)
+    session_token_escaped = shlex.quote(session_token)
+    
+    config_command = f"""mkdir -p ~/.aws && \
+cat > ~/.aws/credentials << 'CREDS'
+[default]
+aws_access_key_id = {access_key_escaped}
+aws_secret_access_key = {secret_key_escaped}
+aws_session_token = {session_token_escaped}
+CREDS
+cat > ~/.aws/config << 'CONFIG'
+[default]
+region = {region}
+output = json
+CONFIG
+chmod 600 ~/.aws/credentials ~/.aws/config && \
+echo "AWS credentials configured"
+"""
+    
+    success, output, error = _run_ssm_command(ssm_client, instance_id, config_command, log_callback)
+    
+    if not success:
+        raise HTTPException(status_code=500, detail=f"AWS configuration failed: {error or output}")
+    
+    if log_callback:
+        log_callback(_log_message("AWS credentials configured on instance"))
+
+
+def _pull_and_run_container(ssm_client, instance_id: str, ecr_registry: str, repository: str,
+                           image_tag: str, account_id: str, region: str, log_callback=None):
+    """Pull Docker image from ECR and run container via SSM."""
+    if log_callback:
+        log_callback(_log_message(f"Pulling {repository} container from ECR and starting it..."))
+    
+    # Detect GPU vs CPU
+    repo_lower = repository.lower()
+    target_gpu = 0 if 'cpu' in repo_lower else 1
+    gpu_flag = "--gpus all" if target_gpu == 1 else ""
+    
+    container_name = f"{account_id}-{repository}-container"
+    full_image_name = f"{ecr_registry}/{repository}:{image_tag}"
+    simulation_dir = "/home/ec2-user/simulations"
+    
+    run_command = f"""aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {ecr_registry} && \
+docker pull {full_image_name} && \
+if docker ps -a --format '{{{{.Names}}}}' | grep -q "^{container_name}$"; then docker rm -f {container_name}; fi && \
+docker run -dit --name {container_name} --restart unless-stopped --shm-size=4g -v {simulation_dir}:/workspace {gpu_flag} --tmpfs /app/tmp:rw,size=2g {full_image_name} && \
+echo "Container started"
+"""
+    
+    success, output, error = _run_ssm_command(ssm_client, instance_id, run_command, log_callback, timeout=600)
+    
+    if not success:
+        error_msg = error or output
+        # Check for common errors and provide helpful messages
+        if "manifest unknown" in error_msg or "Requested image not found" in error_msg:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Docker image not found in ECR. The repository '{repository}' appears to be empty. Please push an image to ECR first:\n\n"
+                       f"1. Build your Docker image: docker build -t {repository} .\n"
+                       f"2. Tag it: docker tag {repository}:latest {full_image_name}\n"
+                       f"3. Login to ECR: aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {ecr_registry}\n"
+                       f"4. Push: docker push {full_image_name}\n\n"
+                       f"Original error: {error_msg}"
+            )
+        raise HTTPException(status_code=500, detail=f"Container deployment failed: {error_msg}")
+    
+    if log_callback:
+        log_callback(_log_message("Container deployment completed"))
+
+
+def _deploy_with_boto3(req: DeployRequestModel, session_creds: Optional[Dict[str, Any]] = None,
+                       log_callback=None) -> Dict[str, Any]:
+    """Deploy using boto3 (no AWS CLI required)."""
+    # Create boto3 session
+    if session_creds:
+        session = boto3.Session(
+            aws_access_key_id=session_creds['access_key_id'],
+            aws_secret_access_key=session_creds['secret_access_key'],
+            aws_session_token=session_creds['session_token'],
+            region_name=req.region
+        )
+    else:
+        session = _session(req.profile, req.region)
+    
+    ec2_client = session.client('ec2')
+    ssm_client = session.client('ssm')
+    ecr_client = session.client('ecr')
+    iam_client = session.client('iam')
+    
     logs: List[str] = []
-    instance_id = None
-    public_dns = None
-
-    assert process.stdout is not None  # for mypy
-    for line in process.stdout:
-        logs.append(line.rstrip())
-        if "Instance launched:" in line:
-            instance_id = line.strip().split()[-1]
-        elif "Public DNS:" in line:
-            public_dns = line.strip().split()[-1]
-
-    process.wait()
-    if process.returncode != 0:
-        # Try to terminate the instance if we managed to capture an ID.
-        if instance_id:
-            try:
-                _run(
-                    [
-                        "aws",
-                        "ec2",
-                        "terminate-instances",
-                        "--instance-ids",
-                        instance_id,
-                        "--region",
-                        req.region,
-                        "--profile",
-                        req.profile,
-                    ]
-                )
-            except HTTPException:
-                # If termination fails, still surface original error.
-                pass
-        raise HTTPException(
-            status_code=500,
-            detail="Deployment script failed. Check logs for details.",
+    
+    def log(msg: str):
+        formatted = _log_message(msg)
+        logs.append(formatted)
+        if log_callback:
+            log_callback(formatted)
+    
+    try:
+        # Step 1: Get AMI
+        log("Checking AWS prerequisites...")
+        ami_id, root_device_name = _get_latest_ami(ec2_client, ssm_client, req.repository, req.region, log)
+        
+        # Step 2: Ensure security group
+        _ensure_security_group(ec2_client, req.security_group, req.repository, req.region, log)
+        
+        # Step 3: Launch instance (key pair is optional now, only needed for manual SSH access)
+        instance_id, public_dns = _launch_ec2_instance(
+            ec2_client, iam_client, ami_id, req.instance_type, req.key_pair, req.security_group,
+            root_device_name, req.volume_size, req.repository, req.account_id, req.region, log
         )
-
-    if not (instance_id and public_dns):
-        raise HTTPException(
-            status_code=500,
-            detail="Deployment finished but instance details were missing.",
-        )
-
-    return {
-        "instance": {
-            "id": instance_id,
-            "publicDns": public_dns,
-            "instanceType": req.instance_type,
-        },
-        "logs": logs,
-    }
+        
+        # Step 4: Wait for SSM to be ready
+        _wait_for_ssm(ssm_client, instance_id, log)
+        
+        # Step 5: Install Docker
+        _install_docker_on_instance(ssm_client, instance_id, log)
+        
+        # Step 6: Configure AWS credentials on instance (if using session credentials)
+        if session_creds:
+            _configure_aws_on_instance(
+                ssm_client, instance_id, session_creds['access_key_id'], session_creds['secret_access_key'],
+                session_creds['session_token'], req.region, log
+            )
+        
+        # Step 7: Pull and run container
+        ecr_registry = f"{req.account_id}.dkr.ecr.{req.region}.amazonaws.com"
+        _pull_and_run_container(ssm_client, instance_id, ecr_registry, req.repository, "latest", req.account_id, req.region, log)
+        
+        log("Deployment completed successfully!")
+        
+        return {
+            "instance": {
+                "id": instance_id,
+                "publicDns": public_dns,
+                "instanceType": req.instance_type,
+            },
+            "logs": logs,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log(f"[ERROR] Deployment failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Deployment failed: {e}")
 
 
 def _sse(event: str, data: Any) -> str:
@@ -223,7 +972,13 @@ def _sse(event: str, data: Any) -> str:
 
 
 def _describe_instance_dns(profile: str, region: str, instance_id: str) -> str:
+    """Legacy: Get instance DNS using profile."""
     session = _session(profile, region)
+    return _describe_instance_dns_with_session(session, region, instance_id)
+
+
+def _describe_instance_dns_with_session(session: boto3.Session, region: str, instance_id: str) -> str:
+    """Get instance DNS using a boto3 session."""
     ec2 = session.client("ec2")
     try:
         resp = ec2.describe_instances(InstanceIds=[instance_id])
@@ -243,9 +998,73 @@ def _describe_instance_dns(profile: str, region: str, instance_id: str) -> str:
 # ------------------------------------------------------------------------------
 
 
+@app.post("/api/auth/assume-role")
+def assume_role_login(body: AssumeRoleLoginRequest):
+    """Login by assuming an IAM role in the user's AWS account."""
+    try:
+        # Get your AWS credentials (for assuming the role)
+        your_access_key, your_secret_key = _get_your_aws_credentials()
+        
+        # Create STS client with your credentials
+        sts = boto3.client(
+            'sts',
+            aws_access_key_id=your_access_key,
+            aws_secret_access_key=your_secret_key,
+            region_name=body.region
+        )
+        
+        # Prepare assume role parameters
+        assume_role_params = {
+            'RoleArn': body.role_arn,
+            'RoleSessionName': f"{body.session_name}-{uuid.uuid4().hex[:8]}",
+            'DurationSeconds': 3600,  # 1 hour
+        }
+        
+        # Add ExternalId if provided (recommended for security)
+        if body.external_id:
+            assume_role_params['ExternalId'] = body.external_id
+        
+        # Assume the role
+        response = sts.assume_role(**assume_role_params)
+        
+        credentials = response['Credentials']
+        
+        # Extract account ID from the assumed role ARN
+        account_id = body.role_arn.split(':')[4]
+        
+        # Store in session
+        session_id = str(uuid.uuid4())
+        sessions[session_id] = {
+            'access_key_id': credentials['AccessKeyId'],
+            'secret_access_key': credentials['SecretAccessKey'],
+            'session_token': credentials['SessionToken'],
+            'expiration': credentials['Expiration'].isoformat(),
+            'region': body.region,
+            'role_arn': body.role_arn,
+            'account_id': account_id,
+        }
+        
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "expires_at": credentials['Expiration'].isoformat(),
+            "account_id": account_id,
+            "message": f"Successfully assumed role in account {account_id}"
+        }
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        raise HTTPException(
+            status_code=401,
+            detail=f"Failed to assume role: {error_code} - {error_msg}. Please verify the role ARN and trust relationship."
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
 @app.post("/api/sso/login")
 def sso_login(body: LoginRequest):
-    """Trigger AWS SSO login for the given profile/region."""
+    """Trigger AWS SSO login for the given profile/region (legacy)."""
     output = _run(
         ["aws", "sso", "login", "--profile", body.profile, "--region", body.region]
     )
@@ -253,23 +1072,100 @@ def sso_login(body: LoginRequest):
 
 
 @app.get("/api/metadata")
-def metadata(profile: str = "default", region: str = "us-east-1"):
-    """Fetch repositories, key pairs, and security groups for the profile/region."""
-    session = _session(profile, region)
-    ecr = session.client("ecr")
-    ec2 = session.client("ec2")
+def metadata(request: Request, profile: Optional[str] = None, region: str = "us-east-1"):
+    """Fetch repositories, key pairs, and security groups."""
+    # Check for session-based auth first
+    session_id = request.headers.get("X-Session-ID")
+    
+    if session_id:
+        try:
+            # Use assumed role credentials
+            creds = _get_session_credentials(session_id)
+            session = _session_from_credentials(creds, creds['region'])
+            region = creds['region']  # Use region from session
+        except HTTPException as e:
+            # Re-raise HTTP exceptions (401, etc.) as-is
+            raise
+    elif profile:
+        # Legacy: use profile-based auth
+        session = _session(profile, region)
+    else:
+        # No session and no profile - return 401 (not 400) for consistency
+        raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
+    
+    ecr = session.client("ecr", region_name=region)
+    ec2 = session.client("ec2", region_name=region)
 
     try:
-        repos = [
-            r["repositoryName"]
-            for r in ecr.describe_repositories().get("repositories", [])
-        ]
-        key_pairs = [k["KeyName"] for k in ec2.describe_key_pairs().get("KeyPairs", [])]
-        security_groups = [
-            s["GroupName"]
-            for s in ec2.describe_security_groups().get("SecurityGroups", [])
-        ]
-    except (BotoCoreError, ClientError) as exc:  # pragma: no cover
+        # List ECR repositories with explicit region and pagination
+        repos = []
+        try:
+            # First, try to get account ID to verify we're using the right credentials
+            sts = session.client("sts", region_name=region)
+            caller_identity = sts.get_caller_identity()
+            account_id_from_creds = caller_identity.get('Account', 'Unknown')
+            print(f"[DEBUG] Using credentials for account: {account_id_from_creds}")
+            
+            # Now list repositories with pagination
+            paginator = ecr.get_paginator('describe_repositories')
+            for page in paginator.paginate():
+                page_repos = page.get("repositories", [])
+                repos.extend([r["repositoryName"] for r in page_repos])
+                if page_repos:
+                    print(f"[DEBUG] Found {len(page_repos)} repositories in this page")
+            
+            print(f"[DEBUG] ECR describe_repositories successful - Total found: {len(repos)} repositories")
+            if repos:
+                print(f"[DEBUG] Repository names: {repos}")
+            else:
+                print(f"[DEBUG] No repositories found in region {region} for account {account_id_from_creds}")
+        except ClientError as ecr_exc:
+            error_code = ecr_exc.response.get('Error', {}).get('Code', 'Unknown')
+            error_msg = ecr_exc.response.get('Error', {}).get('Message', str(ecr_exc))
+            print(f"[ERROR] ECR API error: {error_code} - {error_msg}")
+            # If it's a permission error, log it but continue with empty list
+            if error_code in ['AccessDenied', 'UnauthorizedOperation']:
+                print(f"[WARNING] ECR permission denied. IAM role needs 'ecr:DescribeRepositories' permission.")
+                repos = []
+            else:
+                raise
+        
+        # List EC2 key pairs
+        key_pairs = []
+        try:
+            key_pairs = [k["KeyName"] for k in ec2.describe_key_pairs().get("KeyPairs", [])]
+        except ClientError as ec2_exc:
+            error_code = ec2_exc.response.get('Error', {}).get('Code', 'Unknown')
+            print(f"[WARNING] EC2 describe_key_pairs error: {error_code}")
+            key_pairs = []
+        
+        # List security groups
+        security_groups = []
+        try:
+            security_groups = [
+                s["GroupName"]
+                for s in ec2.describe_security_groups().get("SecurityGroups", [])
+            ]
+        except ClientError as sg_exc:
+            error_code = sg_exc.response.get('Error', {}).get('Code', 'Unknown')
+            print(f"[WARNING] EC2 describe_security_groups error: {error_code}")
+            security_groups = []
+        
+        # Log for debugging
+        print(f"[DEBUG] Metadata fetch - Region: {region}, Repos: {len(repos)}, KeyPairs: {len(key_pairs)}, SecurityGroups: {len(security_groups)}")
+        if repos:
+            print(f"[DEBUG] Repository names: {repos}")
+        
+    except ClientError as exc:
+        error_code = exc.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = exc.response.get('Error', {}).get('Message', str(exc))
+        print(f"[ERROR] AWS API error: {error_code} - {error_msg}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"AWS API error ({error_code}): {error_msg}. Check IAM role permissions."
+        ) from exc
+    except (BotoCoreError, Exception) as exc:  # pragma: no cover
+        print(f"[ERROR] Unexpected error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
@@ -280,9 +1176,22 @@ def metadata(profile: str = "default", region: str = "us-east-1"):
 
 
 @app.get("/api/instances")
-def instances(profile: str = "default", region: str = "us-east-1"):
-    """List running EC2 instances for the profile/region."""
-    session = _session(profile, region)
+def instances(request: Request, profile: Optional[str] = None, region: str = "us-east-1"):
+    """List running EC2 instances."""
+    # Check for session-based auth first
+    session_id = request.headers.get("X-Session-ID")
+    
+    if session_id:
+        # Use assumed role credentials
+        creds = _get_session_credentials(session_id)
+        session = _session_from_credentials(creds, creds['region'])
+        region = creds['region']  # Use region from session
+    elif profile:
+        # Legacy: use profile-based auth
+        session = _session(profile, region)
+    else:
+        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
+    
     ec2 = session.client("ec2")
     try:
         resp = ec2.describe_instances(
@@ -326,29 +1235,57 @@ def instances(profile: str = "default", region: str = "us-east-1"):
 
 
 @app.post("/api/deploy")
-def deploy(body: DeployRequestModel):
+def deploy(request: Request, body: DeployRequestModel):
     """Run the existing deploy-ec2.sh script with the provided parameters."""
-    payload = _run_deploy_script(body)
+    # Check for session-based auth
+    session_id = request.headers.get("X-Session-ID")
+    session_creds = None
+    
+    if session_id:
+        session_creds = _get_session_credentials(session_id)
+        # Override account_id from session if available
+        if 'account_id' in session_creds:
+            body.account_id = session_creds['account_id']
+    
+    # Use new boto3-based deployment (no AWS CLI required)
+    payload = _deploy_with_boto3(body, session_creds)
     return {"status": "ok", **payload}
 
 
 @app.get("/api/deploy/stream")
 def deploy_stream(
-    profile: str,
-    region: str,
-    account_id: str,
-    repository: str,
-    instance_type: str,
-    key_pair: str,
-    security_group: str,
+    request: Request,
+    profile: Optional[str] = None,
+    region: str = "us-east-1",
+    account_id: Optional[str] = None,
+    repository: str = "",
+    instance_type: str = "",
+    key_pair: str = "",
+    security_group: str = "",
     volume_size: int = 30,
+    session_id: Optional[str] = None,  # Query parameter for EventSource
 ):
     """Stream deploy logs as server-sent events while running deploy-ec2.sh."""
+    
+    # Check for session-based auth (from header or query param)
+    if not session_id:
+        session_id = request.headers.get("X-Session-ID")
+    session_creds = None
+    
+    if session_id:
+        session_creds = _get_session_credentials(session_id)
+        # Use account_id and region from session
+        if not account_id and 'account_id' in session_creds:
+            account_id = session_creds['account_id']
+        if not region:
+            region = session_creds['region']
+    elif not profile:
+        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
 
     req = DeployRequestModel(
-        profile=profile,
+        profile=profile or "default",
         region=region,
-        account_id=account_id,
+        account_id=account_id or "",
         repository=repository,
         instance_type=instance_type,
         key_pair=key_pair,
@@ -357,88 +1294,118 @@ def deploy_stream(
     )
 
     def event_stream():
-        env = os.environ.copy() | {
-            "AWS_REGION": req.region,
-            "AWS_ACCOUNT_ID": req.account_id,
-            "ECR_REPOSITORY": req.repository,
-            "INSTANCE_TYPE": req.instance_type,
-            "KEY_PAIR_NAME": req.key_pair,
-            "SECURITY_GROUP_NAME": req.security_group,
-            "VOLUME_SIZE": str(req.volume_size),
-            "AWS_PROFILE": req.profile,
-            "SSO_SESSION": req.profile,
-        }
-
-        process = subprocess.Popen(
-            ["bash", str(_script_path())],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
-
+        import queue
+        logs_queue = queue.Queue()
         instance_id = None
         public_dns = None
-
-        assert process.stdout is not None  # for mypy
-        for line in process.stdout:
-            line = line.rstrip()
-            yield _sse("log", line)
-            lower = line.lower()
-            for text, pct in AwsMilestones:
-                if text in lower:
-                    yield _sse("progress", pct)
-                    break
-            if "Instance launched:" in line:
-                instance_id = line.strip().split()[-1]
-            elif "Public DNS:" in line:
-                public_dns = line.strip().split()[-1]
-
-        process.wait()
-        if process.returncode != 0:
-            if instance_id:
+        deployment_done = False
+        deployment_error = None
+        
+        def log_callback(message: str):
+            """Collect logs and extract instance info."""
+            nonlocal instance_id, public_dns
+            logs_queue.put(("log", message))
+            # Extract instance info from log messages
+            if "Instance launched:" in message:
+                parts = message.split()
+                if len(parts) > 0:
+                    instance_id = parts[-1]
+            elif "Public DNS:" in message:
+                parts = message.split()
+                if len(parts) > 0:
+                    public_dns = parts[-1]
+        
+        # Start deployment in a thread so we can yield logs in real-time
+        import threading
+        def run_deployment():
+            nonlocal deployment_done, deployment_error, instance_id, public_dns
+            try:
+                result = _deploy_with_boto3(req, session_creds, log_callback=log_callback)
+                instance_id = result["instance"]["id"]
+                public_dns = result["instance"]["publicDns"]
+                logs_queue.put(("success", {"instanceId": instance_id, "publicDns": public_dns}))
+            except HTTPException as e:
+                deployment_error = e
+                logs_queue.put(("error", str(e.detail)))
+            except Exception as e:
+                deployment_error = e
+                logs_queue.put(("error", f"Deployment failed: {str(e)}"))
+            finally:
+                deployment_done = True
+                logs_queue.put(None)  # Sentinel to signal completion
+        
+        # Start deployment thread
+        deploy_thread = threading.Thread(target=run_deployment, daemon=True)
+        deploy_thread.start()
+        
+        # Yield logs as they come in
+        try:
+            while True:
                 try:
-                    _run(
-                        [
-                            "aws",
-                            "ec2",
-                            "terminate-instances",
-                            "--instance-ids",
-                            instance_id,
-                            "--region",
-                            req.region,
-                            "--profile",
-                            req.profile,
-                        ]
-                    )
-                except HTTPException:
+                    item = logs_queue.get(timeout=1)
+                    if item is None:  # Sentinel
+                        break
+                    
+                    event_type, data = item
+                    
+                    if event_type == "log":
+                        yield _sse("log", data)
+                        # Check for progress milestones
+                        lower = data.lower()
+                        for text, pct in AwsMilestones:
+                            if text in lower:
+                                yield _sse("progress", pct)
+                                break
+                    elif event_type == "success":
+                        yield _sse("success", data)
+                        break
+                    elif event_type == "error":
+                        yield _sse("error", data)
+                        break
+                except queue.Empty:
+                    # Check if deployment thread is still alive
+                    if not deploy_thread.is_alive() and deployment_done:
+                        break
+                    continue
+        except GeneratorExit:
+            # Client disconnected, cleanup if needed
+            pass
+        finally:
+            # Cleanup: try to terminate instance if deployment failed and instance was created
+            if deployment_error and instance_id:
+                try:
+                    if session_creds:
+                        session = boto3.Session(
+                            aws_access_key_id=session_creds['access_key_id'],
+                            aws_secret_access_key=session_creds['secret_access_key'],
+                            aws_session_token=session_creds['session_token'],
+                            region_name=req.region
+                        )
+                    else:
+                        session = _session(req.profile, req.region)
+                    ec2_client = session.client('ec2')
+                    ec2_client.terminate_instances(InstanceIds=[instance_id])
+                except Exception:
                     pass
-            yield _sse("error", "Deployment failed. Check logs.")
-            return
-
-        if not (instance_id and public_dns):
-            yield _sse(
-                "error", "Deployment finished but instance details were missing."
-            )
-            return
-
-        yield _sse(
-            "complete",
-            {
-                "instance": {
-                    "id": instance_id,
-                    "publicDns": public_dns,
-                    "instanceType": req.instance_type,
-                }
-            },
-        )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/terminate")
-def terminate(body: TerminateRequest):
-    session = _session(body.profile, body.region)
+def terminate(request: Request, body: TerminateRequest):
+    # Check for session-based auth first
+    session_id = request.headers.get("X-Session-ID")
+    
+    if session_id:
+        # Use assumed role credentials
+        creds = _get_session_credentials(session_id)
+        session = _session_from_credentials(creds, body.region)
+    elif body.profile:
+        # Legacy: use profile-based auth
+        session = _session(body.profile, body.region)
+    else:
+        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
+    
     ec2 = session.client("ec2")
     try:
         ec2.terminate_instances(InstanceIds=[body.instance_id])
@@ -448,8 +1415,20 @@ def terminate(body: TerminateRequest):
 
 
 @app.post("/api/connect")
-def connect(body: ConnectRequest):
-    public_dns = _describe_instance_dns(body.profile, body.region, body.instance_id)
+def connect(request: Request, body: ConnectRequest):
+    # Check for session-based auth first
+    session_id = request.headers.get("X-Session-ID")
+    
+    if session_id:
+        # Use assumed role credentials
+        creds = _get_session_credentials(session_id)
+        session = _session_from_credentials(creds, body.region)
+        public_dns = _describe_instance_dns_with_session(session, body.region, body.instance_id)
+    elif body.profile:
+        # Legacy: use profile-based auth
+        public_dns = _describe_instance_dns(body.profile, body.region, body.instance_id)
+    else:
+        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
     key_path = os.path.expanduser(body.key_path or f"~/.ssh/{body.instance_id}.pem")
     ssh_cmd = f"ssh -i {shlex.quote(key_path)} {body.ssh_user}@{public_dns}"
 
@@ -475,26 +1454,242 @@ def connect(body: ConnectRequest):
 
 
 @app.post("/api/upload")
-def upload(body: UploadRequest):
-    dns = _describe_instance_dns(body.profile, body.region, body.instance_id)
-    key_path = os.path.expanduser(body.key_path or "~/.ssh/id_rsa")
-    local = os.path.expanduser(body.local_path)
-    dest = f"{body.ssh_user}@{dns}:{body.destination_path}"
+def upload(request: Request, body: UploadRequest):
+    """Upload file to EC2 instance using S3 + SSM (no SSH required)."""
+    # Check for session-based auth first
+    session_id = request.headers.get("X-Session-ID")
+    
+    if session_id:
+        # Use assumed role credentials
+        creds = _get_session_credentials(session_id)
+        session = _session_from_credentials(creds, body.region)
+        account_id = creds.get('account_id', '')
+    elif body.profile:
+        # Legacy: use profile-based auth
+        session = _session(body.profile, body.region)
+        # Get account ID from STS
+        sts = session.client('sts')
+        account_id = sts.get_caller_identity()['Account']
+    else:
+        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
+    
+    s3_client = session.client('s3', region_name=body.region)
+    ssm_client = session.client('ssm', region_name=body.region)
+    
+    # Generate unique S3 key for this transfer
+    import hashlib
+    file_hash = hashlib.md5(f"{body.instance_id}{body.local_path}{time.time()}".encode()).hexdigest()[:8]
+    bucket_name = f"inversion-deployer-temp-{account_id}"
+    s3_key = f"uploads/{body.instance_id}/{file_hash}/{os.path.basename(body.local_path)}"
+    
     try:
-        subprocess.check_call(["scp", "-i", key_path, local, dest])
-    except subprocess.CalledProcessError as exc:  # pragma: no cover
-        raise HTTPException(status_code=500, detail=exc.output or str(exc)) from exc
-    return {"status": "ok", "message": f"Uploaded {local} to {dest}"}
+        # Step 1: Create S3 bucket if it doesn't exist
+        try:
+            s3_client.head_bucket(Bucket=bucket_name)
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == '404' or error_code == '403':
+                # Bucket doesn't exist, create it
+                try:
+                    s3_client.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration={'LocationConstraint': body.region} if body.region != 'us-east-1' else {}
+                    )
+                    # Add lifecycle policy to auto-delete after 24 hours
+                    s3_client.put_bucket_lifecycle_configuration(
+                        Bucket=bucket_name,
+                        LifecycleConfiguration={
+                            'Rules': [{
+                                'Id': 'DeleteOldUploads',
+                                'Status': 'Enabled',
+                                'Expiration': {'Days': 1}
+                            }]
+                        }
+                    )
+                except ClientError as create_err:
+                    if create_err.response.get('Error', {}).get('Code') != 'BucketAlreadyOwnedByYou':
+                        raise
+        
+        # Step 2: Upload file to S3
+        local_path = os.path.expanduser(body.local_path)
+        if not os.path.exists(local_path):
+            raise HTTPException(status_code=404, detail=f"Local file not found: {local_path}")
+        
+        s3_client.upload_file(local_path, bucket_name, s3_key)
+        s3_url = f"s3://{bucket_name}/{s3_key}"
+        
+        # Step 3: Use SSM to download from S3 to instance
+        if body.container_name:
+            # Upload to container: copy to instance first, then into container
+            instance_path = f"/tmp/{os.path.basename(body.local_path)}"
+            download_cmd = f"aws s3 cp {s3_url} {instance_path}"
+            copy_to_container_cmd = f"docker cp {instance_path} {body.container_name}:{body.destination_path} && rm -f {instance_path}"
+            command = f"{download_cmd} && {copy_to_container_cmd}"
+        else:
+            # Upload to instance filesystem
+            command = f"aws s3 cp {s3_url} {body.destination_path}"
+        
+        response = ssm_client.send_command(
+            InstanceIds=[body.instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={'commands': [command]},
+            TimeoutSeconds=300
+        )
+        command_id = response['Command']['CommandId']
+        
+        # Step 4: Wait for command to complete
+        import time
+        for _ in range(30):  # Wait up to 5 minutes
+            time.sleep(10)
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=body.instance_id
+            )
+            status = result['Status']
+            if status in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
+                break
+        
+        if result['Status'] != 'Success':
+            error_output = result.get('StandardErrorContent', 'Unknown error')
+            raise HTTPException(
+                status_code=500,
+                detail=f"SSM command failed: {error_output}"
+            )
+        
+        # Step 5: Clean up S3 file
+        try:
+            s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+        except Exception:
+            pass  # Don't fail if cleanup fails
+        
+        return {
+            "status": "ok",
+            "message": f"Uploaded {local_path} to {body.destination_path}",
+            "method": "S3 + SSM"
+        }
+    except HTTPException:
+        raise
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"AWS error ({error_code}): {error_msg}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
 @app.post("/api/download")
-def download(body: DownloadRequest):
-    dns = _describe_instance_dns(body.profile, body.region, body.instance_id)
-    key_path = os.path.expanduser(body.key_path or "~/.ssh/id_rsa")
-    local = os.path.expanduser(body.local_path or ".")
-    remote = f"{body.ssh_user}@{dns}:{body.remote_path}"
+def download(request: Request, body: DownloadRequest):
+    """Download file from EC2 instance using S3 + SSM (no SSH required)."""
+    # Check for session-based auth first
+    session_id = request.headers.get("X-Session-ID")
+    
+    if session_id:
+        # Use assumed role credentials
+        creds = _get_session_credentials(session_id)
+        session = _session_from_credentials(creds, body.region)
+        account_id = creds.get('account_id', '')
+    elif body.profile:
+        # Legacy: use profile-based auth
+        session = _session(body.profile, body.region)
+        # Get account ID from STS
+        sts = session.client('sts')
+        account_id = sts.get_caller_identity()['Account']
+    else:
+        raise HTTPException(status_code=400, detail="Either session_id or profile must be provided")
+    
+    s3_client = session.client('s3', region_name=body.region)
+    ssm_client = session.client('ssm', region_name=body.region)
+    
+    # Generate unique S3 key for this transfer
+    import hashlib
+    file_hash = hashlib.md5(f"{body.instance_id}{body.remote_path}{time.time()}".encode()).hexdigest()[:8]
+    bucket_name = f"inversion-deployer-temp-{account_id}"
+    s3_key = f"downloads/{body.instance_id}/{file_hash}/{os.path.basename(body.remote_path)}"
+    
     try:
-        subprocess.check_call(["scp", "-i", key_path, remote, local])
-    except subprocess.CalledProcessError as exc:  # pragma: no cover
-        raise HTTPException(status_code=500, detail=exc.output or str(exc)) from exc
-    return {"status": "ok", "message": f"Downloaded {remote} to {local}"}
+        # Step 1: Ensure S3 bucket exists
+        try:
+            s3_client.head_bucket(Bucket=bucket_name)
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == '404' or error_code == '403':
+                try:
+                    s3_client.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration={'LocationConstraint': body.region} if body.region != 'us-east-1' else {}
+                    )
+                except ClientError as create_err:
+                    if create_err.response.get('Error', {}).get('Code') != 'BucketAlreadyOwnedByYou':
+                        raise
+        
+        # Step 2: Use SSM to upload from instance to S3
+        if body.container_name:
+            # Download from container: copy from container to instance first, then to S3
+            instance_path = f"/tmp/{os.path.basename(body.remote_path)}"
+            copy_from_container_cmd = f"docker cp {body.container_name}:{body.remote_path} {instance_path}"
+            upload_cmd = f"aws s3 cp {instance_path} s3://{bucket_name}/{s3_key} && rm -f {instance_path}"
+            command = f"{copy_from_container_cmd} && {upload_cmd}"
+        else:
+            # Download from instance filesystem
+            command = f"aws s3 cp {body.remote_path} s3://{bucket_name}/{s3_key}"
+        
+        response = ssm_client.send_command(
+            InstanceIds=[body.instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={'commands': [command]},
+            TimeoutSeconds=300
+        )
+        command_id = response['Command']['CommandId']
+        
+        # Step 3: Wait for command to complete
+        import time
+        for _ in range(30):  # Wait up to 5 minutes
+            time.sleep(10)
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=body.instance_id
+            )
+            status = result['Status']
+            if status in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
+                break
+        
+        if result['Status'] != 'Success':
+            error_output = result.get('StandardErrorContent', 'Unknown error')
+            raise HTTPException(
+                status_code=500,
+                detail=f"SSM command failed: {error_output}"
+            )
+        
+        # Step 4: Download from S3 to local
+        local_path = os.path.expanduser(body.local_path or ".")
+        if os.path.isdir(local_path):
+            # If local_path is a directory, append filename
+            local_path = os.path.join(local_path, os.path.basename(body.remote_path))
+        
+        s3_client.download_file(bucket_name, s3_key, local_path)
+        
+        # Step 5: Clean up S3 file
+        try:
+            s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+        except Exception:
+            pass  # Don't fail if cleanup fails
+        
+        return {
+            "status": "ok",
+            "message": f"Downloaded {body.remote_path} to {local_path}",
+            "method": "S3 + SSM"
+        }
+    except HTTPException:
+        raise
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"AWS error ({error_code}): {error_msg}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
