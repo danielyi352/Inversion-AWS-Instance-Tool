@@ -11,6 +11,12 @@ const defaultConfig: AwsConfig = {
   ecrRepository: '',
   instanceType: 't3.medium',
   volumeSize: 30,
+  volumeType: 'gp3',
+  availabilityZone: '',
+  subnetId: '',
+  userData: '',
+  amiType: 'auto',
+  amiId: '',
 };
 
 export function useAwsConfig() {
@@ -32,6 +38,7 @@ export function useAwsConfig() {
     currentFile: '',
   });
   const [deploySource, setDeploySource] = useState<EventSource | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [repositoryStatus, setRepositoryStatus] = useState<{
     exists: boolean;
     hasImages: boolean;
@@ -150,7 +157,12 @@ export function useAwsConfig() {
   };
 
   const handleRefresh = async () => {
+    if (isRefreshing) {
+      return; // Prevent multiple simultaneous refreshes
+    }
+    
     try {
+      setIsRefreshing(true);
       // Check if we have a session ID
       const sessionId = localStorage.getItem('aws_session_id');
       if (!sessionId) {
@@ -183,6 +195,7 @@ export function useAwsConfig() {
         addLog('Cannot reach backend server. Is it running on port 8000?', 'error');
       }
     } finally {
+      setIsRefreshing(false);
       setTimeout(() => setProgress(0), 400);
     }
   };
@@ -420,6 +433,7 @@ export function useAwsConfig() {
     setTransferStatus,
     repositoryStatus,
     clearRepositoryStatus,
+    isRefreshing,
     handleRoleLogin,
     handleSsoLogin,
     handleRefresh,

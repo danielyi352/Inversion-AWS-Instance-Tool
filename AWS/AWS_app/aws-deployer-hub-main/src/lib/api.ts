@@ -165,6 +165,12 @@ export function deploy(config: AwsConfig & { accountId: string }) {
       instance_type: config.instanceType,
       security_group: null,  // Will use default automatically
       volume_size: config.volumeSize,
+      volume_type: config.volumeType || 'gp3',
+      availability_zone: config.availabilityZone || null,
+      subnet_id: config.subnetId || null,
+      user_data: config.userData || null,
+      ami_id: config.amiId || null,
+      ami_type: config.amiType || 'auto',
     }),
   });
 }
@@ -178,7 +184,22 @@ export function deployStream(config: AwsConfig & { accountId: string }) {
     instance_type: config.instanceType,
     security_group: "",  // Will use default automatically
     volume_size: String(config.volumeSize),
+    volume_type: config.volumeType || 'gp3',
   });
+  
+  if (config.availabilityZone) {
+    params.append('availability_zone', config.availabilityZone);
+  }
+  if (config.subnetId) {
+    params.append('subnet_id', config.subnetId);
+  }
+  if (config.userData) {
+    params.append('user_data', config.userData);
+  }
+  if (config.amiId) {
+    params.append('ami_id', config.amiId);
+  }
+  params.append('ami_type', config.amiType || 'auto');
   
   // EventSource doesn't support custom headers, so we'll pass session_id as a param
   // Backend will need to handle this

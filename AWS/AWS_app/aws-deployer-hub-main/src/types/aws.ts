@@ -4,6 +4,12 @@ export interface AwsConfig {
   ecrRepository: string;
   instanceType: string;
   volumeSize: number;
+  volumeType?: string;
+  availabilityZone?: string;
+  subnetId?: string;
+  userData?: string;
+  amiId?: string;
+  amiType?: string; // 'auto', 'al2023', 'deep-learning-gpu', 'ubuntu-22', 'custom'
 }
 
 export interface RunningInstance {

@@ -10,9 +10,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Loader2, CheckCircle2, XCircle, AlertCircle } from 'lucide-react';
+import { Loader2, CheckCircle2, XCircle, AlertCircle, RefreshCw } from 'lucide-react';
 import type { AwsConfig } from '@/types/aws';
-import { AWS_REGIONS, INSTANCE_TYPES } from '@/types/aws';
+import { AWS_REGIONS } from '@/types/aws';
 
 interface RepositoryStatus {
   exists: boolean;
@@ -30,6 +30,8 @@ interface AwsConfigCardProps {
   onConnectRepository?: (repository: string, region: string) => Promise<RepositoryStatus>;
   repositoryStatus?: RepositoryStatus | null;
   onClearRepositoryStatus?: () => void;
+  onRefresh?: () => void;
+  isRefreshing?: boolean;
 }
 
 export function AwsConfigCard({
@@ -39,6 +41,8 @@ export function AwsConfigCard({
   onConnectRepository,
   repositoryStatus,
   onClearRepositoryStatus,
+  onRefresh,
+  isRefreshing = false,
 }: AwsConfigCardProps) {
   const [isCheckingRepo, setIsCheckingRepo] = useState(false);
 
@@ -64,7 +68,21 @@ export function AwsConfigCard({
   return (
     <Card className="border-border/60 shadow-sm">
       <CardHeader className="pb-4">
-        <CardTitle className="text-base font-medium">AWS Configuration</CardTitle>
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base font-medium">Repository Configuration</CardTitle>
+          {onRefresh && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onRefresh}
+              disabled={isRefreshing}
+              className="gap-2 border-border/60"
+            >
+              <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+              {isRefreshing ? 'Refreshing...' : 'Refresh'}
+            </Button>
+          )}
+        </div>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-4">
@@ -196,42 +214,6 @@ export function AwsConfigCard({
               </div>
             </div>
           )}
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="instanceType" className="text-right text-sm text-muted-foreground">
-              Instance Type
-            </Label>
-            <Select
-              value={config.instanceType}
-              onValueChange={(value) => onConfigChange({ instanceType: value })}
-            >
-              <SelectTrigger className="bg-muted/50 border-border/60">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {INSTANCE_TYPES.map((type) => (
-                  <SelectItem key={type.value} value={type.value}>
-                    {type.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="volumeSize" className="text-right text-sm text-muted-foreground">
-              Volume Size (GiB)
-            </Label>
-            <Input
-              id="volumeSize"
-              type="number"
-              min={1}
-              max={2048}
-              value={config.volumeSize}
-              onChange={(e) => onConfigChange({ volumeSize: parseInt(e.target.value) || 30 })}
-              className="bg-muted/50 border-border/60 w-32"
-            />
-          </div>
         </div>
       </CardContent>
     </Card>

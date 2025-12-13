@@ -78,6 +78,12 @@ class DeployRequestModel(BaseModel):
     key_pair: Optional[str] = Field(None, description="EC2 key pair name (deprecated - not used, SSM is used instead)")
     security_group: Optional[str] = Field(None, description="Security group name (optional - defaults to 'inversion-deployer-default')")
     volume_size: int = Field(default=30, ge=1, le=2048)
+    volume_type: Optional[str] = Field(default='gp3', description="EBS volume type (gp3, gp2, io1, io2, st1, sc1)")
+    availability_zone: Optional[str] = Field(None, description="Availability zone (optional - uses default if not specified)")
+    subnet_id: Optional[str] = Field(None, description="Subnet ID (optional - uses default VPC if not specified)")
+    user_data: Optional[str] = Field(None, description="User data script (optional - base64 encoded bash script)")
+    ami_id: Optional[str] = Field(None, description="Custom AMI ID (optional - uses auto-detection if not specified)")
+    ami_type: Optional[str] = Field(None, description="AMI type: 'auto', 'al2023', 'deep-learning-gpu', 'ubuntu-22', 'custom'")
 
 
 class TerminateRequest(BaseModel):
@@ -439,11 +445,62 @@ def _ensure_iam_role(iam_client, role_name: str, account_id: str, log_callback=N
 # Key pair functions removed - all access is via SSM using IAM instance profiles
 
 
-def _get_latest_ami(ec2_client, ssm_client, repository: str, region: str, log_callback=None) -> tuple:
-    """Get latest AMI ID and root device name. Returns (ami_id, root_device_name)."""
-    # Detect GPU vs CPU based on repository name
-    repo_lower = repository.lower()
-    target_gpu = 0 if 'cpu' in repo_lower else 1
+def _get_latest_ami(ec2_client, ssm_client, repository: str, region: str, log_callback=None,
+                   ami_id: Optional[str] = None, ami_type: Optional[str] = None) -> tuple:
+    """Get latest AMI ID and root device name. Returns (ami_id, root_device_name).
+    
+    Args:
+        ami_id: Custom AMI ID to use (if provided, this takes precedence)
+        ami_type: AMI type selection ('auto', 'al2023', 'deep-learning-gpu', 'ubuntu-22', 'custom')
+    """
+    # If custom AMI ID is provided, use it directly
+    if ami_id:
+        if log_callback:
+            log_callback(_log_message(f"Using custom AMI: {ami_id}"))
+        try:
+            response = ec2_client.describe_images(ImageIds=[ami_id])
+            root_device_name = response['Images'][0]['RootDeviceName']
+            if log_callback:
+                log_callback(_log_message(f"AMI root device: {root_device_name}"))
+            return ami_id, root_device_name
+        except ClientError as e:
+            raise HTTPException(status_code=500, detail=f"Invalid custom AMI ID {ami_id}: {e}")
+    
+    # Determine AMI type based on selection or auto-detect
+    if ami_type == 'al2023':
+        target_gpu = 0
+    elif ami_type == 'deep-learning-gpu':
+        target_gpu = 1
+    elif ami_type == 'ubuntu-22':
+        # Ubuntu 22.04 LTS
+        if log_callback:
+            log_callback(_log_message("Finding latest Ubuntu Server 22.04 LTS AMI (x86_64)..."))
+        try:
+            response = ec2_client.describe_images(
+                Owners=['099720109477'],  # Canonical
+                Filters=[
+                    {'Name': 'name', 'Values': ['ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*']},
+                    {'Name': 'state', 'Values': ['available']},
+                    {'Name': 'architecture', 'Values': ['x86_64']}
+                ]
+            )
+            images = sorted(response['Images'], key=lambda x: x['CreationDate'], reverse=True)
+            if not images:
+                raise HTTPException(status_code=500, detail="Could not find Ubuntu 22.04 AMI")
+            ami_id = images[0]['ImageId']
+            root_device_name = images[0]['RootDeviceName']
+            if log_callback:
+                log_callback(_log_message(f"Using AMI: {ami_id} (root device: {root_device_name})"))
+            return ami_id, root_device_name
+        except ClientError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to find Ubuntu AMI: {e}")
+    elif ami_type == 'auto' or ami_type is None:
+        # Auto-detect: Detect GPU vs CPU based on repository name
+        repo_lower = repository.lower()
+        target_gpu = 0 if 'cpu' in repo_lower else 1
+    else:
+        # Default to CPU if unknown type
+        target_gpu = 0
     
     if target_gpu == 1:
         # GPU AMI
@@ -522,7 +579,9 @@ def _ensure_security_group(ec2_client, security_group_name: str, repository: str
 
 def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str,
                         security_group_name: str, root_device_name: str, volume_size: int,
-                        repository: str, account_id: str, region: str, log_callback=None) -> tuple:
+                        repository: str, account_id: str, region: str, log_callback=None,
+                        volume_type: Optional[str] = 'gp3', availability_zone: Optional[str] = None,
+                        subnet_id: Optional[str] = None, user_data: Optional[str] = None) -> tuple:
     """Launch EC2 instance and wait for it to be running. Returns (instance_id, public_dns).
     
     Note: Key pairs are not used - all access is via SSM.
@@ -570,6 +629,26 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
         'MinCount': 1,
         'MaxCount': 1
     }
+    
+    # Add optional parameters
+    if availability_zone:
+        run_params['Placement'] = {'AvailabilityZone': availability_zone}
+    
+    if subnet_id:
+        run_params['SubnetId'] = subnet_id
+        # Note: When SubnetId is specified, SecurityGroups should be IDs, not names
+        # But we'll keep the name for now - AWS will handle it
+    
+    if user_data:
+        # User data should be base64 encoded
+        try:
+            # Try to decode to see if it's already base64
+            base64.b64decode(user_data, validate=True)
+            # If successful, it's already base64
+            run_params['UserData'] = user_data
+        except Exception:
+            # Not base64, encode it
+            run_params['UserData'] = base64.b64encode(user_data.encode('utf-8')).decode('utf-8')
     
     try:
         response = ec2_client.run_instances(**run_params)
@@ -837,7 +916,10 @@ def _deploy_with_boto3(req: DeployRequestModel, session_creds: Optional[Dict[str
     try:
         # Step 1: Get AMI
         log("Checking AWS prerequisites...")
-        ami_id, root_device_name = _get_latest_ami(ec2_client, ssm_client, req.repository, req.region, log)
+        ami_id, root_device_name = _get_latest_ami(
+            ec2_client, ssm_client, req.repository, req.region, log,
+            ami_id=req.ami_id, ami_type=req.ami_type
+        )
         
         # Step 2: Ensure security group (use default name if not provided)
         security_group_name = req.security_group or f"inversion-deployer-default-{req.account_id}"
@@ -846,7 +928,9 @@ def _deploy_with_boto3(req: DeployRequestModel, session_creds: Optional[Dict[str
         # Step 3: Launch instance (no key pair needed - using SSM for all access)
         instance_id, public_dns = _launch_ec2_instance(
             ec2_client, iam_client, ami_id, req.instance_type, security_group_name,
-            root_device_name, req.volume_size, req.repository, req.account_id, req.region, log
+            root_device_name, req.volume_size, req.repository, req.account_id, req.region, log,
+            volume_type=req.volume_type, availability_zone=req.availability_zone,
+            subnet_id=req.subnet_id, user_data=req.user_data
         )
         
         # Step 4: Wait for SSM to be ready
@@ -1306,6 +1390,12 @@ def deploy_stream(
     key_pair: str = "",
     security_group: str = "",  # Deprecated - not used, will use default
     volume_size: int = 30,
+    volume_type: str = "gp3",
+    availability_zone: Optional[str] = None,
+    subnet_id: Optional[str] = None,
+    user_data: Optional[str] = None,
+    ami_id: Optional[str] = None,
+    ami_type: Optional[str] = None,
     session_id: Optional[str] = None,  # Query parameter for EventSource
 ):
     """Stream deploy logs as server-sent events while running deploy-ec2.sh."""
@@ -1334,6 +1424,12 @@ def deploy_stream(
         key_pair=None,  # Not used - SSM is used instead
         security_group=None,  # Will use default name automatically
         volume_size=volume_size,
+        volume_type=volume_type,
+        availability_zone=availability_zone,
+        subnet_id=subnet_id,
+        user_data=user_data,
+        ami_id=ami_id,
+        ami_type=ami_type,
     )
 
     def event_stream():

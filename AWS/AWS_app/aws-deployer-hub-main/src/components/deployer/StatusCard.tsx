@@ -1,4 +1,5 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
@@ -7,6 +8,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Label } from '@/components/ui/label';
+import { Power } from 'lucide-react';
 import type { RunningInstance } from '@/types/aws';
 
 interface StatusCardProps {
@@ -14,6 +16,7 @@ interface StatusCardProps {
   instances: RunningInstance[];
   selectedInstance: string | null;
   onSelectInstance: (id: string) => void;
+  onTerminate?: () => void;
 }
 
 export function StatusCard({
@@ -21,13 +24,27 @@ export function StatusCard({
   instances,
   selectedInstance,
   onSelectInstance,
+  onTerminate,
 }: StatusCardProps) {
   const selectedInstanceData = instances.find((i) => i.id === selectedInstance);
 
   return (
     <Card className="border-border/60 shadow-sm">
       <CardHeader className="pb-4">
-        <CardTitle className="text-base font-medium">Status & Instances</CardTitle>
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base font-medium">Status & Instances</CardTitle>
+          {onTerminate && (
+            <Button
+              variant="outline"
+              onClick={onTerminate}
+              disabled={!selectedInstance}
+              className="gap-2 border-destructive/60 text-destructive hover:bg-destructive hover:text-destructive-foreground"
+            >
+              <Power className="h-4 w-4" />
+              Terminate
+            </Button>
+          )}
+        </div>
       </CardHeader>
       <CardContent className="space-y-5">
         <div className="flex items-center gap-3">

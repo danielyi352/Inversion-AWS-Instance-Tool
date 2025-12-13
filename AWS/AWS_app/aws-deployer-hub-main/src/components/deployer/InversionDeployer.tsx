@@ -5,8 +5,8 @@ import { Button } from '@/components/ui/button';
 import { LogOut } from 'lucide-react';
 import { useAwsConfig } from '@/hooks/useAwsConfig';
 import { AwsConfigCard } from './AwsConfigCard';
+import { InstanceConfigCard } from './InstanceConfigCard';
 import { StatusCard } from './StatusCard';
-import { ActionToolbar } from './ActionToolbar';
 import { ProgressLogArea } from './ProgressLogArea';
 import { DockerImageUploadSection } from './DockerImageUploadSection';
 import { ContainerFileBrowser } from './ContainerFileBrowser';
@@ -33,6 +33,7 @@ export function InversionDeployer() {
     metadata,
     repositoryStatus,
     clearRepositoryStatus,
+    isRefreshing,
     handleRoleLogin,
     handleRefresh,
     handleConnectRepository,
@@ -103,19 +104,22 @@ export function InversionDeployer() {
           <div className="space-y-8">
             {/* Top Panels */}
             <div className="grid gap-6 lg:grid-cols-2">
-            <AwsConfigCard
-              config={config}
-              onConfigChange={updateConfig}
-              ecrRepositories={metadata.repositories}
-              onConnectRepository={handleConnectRepository}
-              repositoryStatus={repositoryStatus}
-              onClearRepositoryStatus={clearRepositoryStatus}
-            />
+              <AwsConfigCard
+                config={config}
+                onConfigChange={updateConfig}
+                ecrRepositories={metadata.repositories}
+                onConnectRepository={handleConnectRepository}
+                repositoryStatus={repositoryStatus}
+                onClearRepositoryStatus={clearRepositoryStatus}
+                onRefresh={handleRefresh}
+                isRefreshing={isRefreshing}
+              />
               <StatusCard
                 isLoggedIn={isLoggedIn}
                 instances={instances}
                 selectedInstance={selectedInstance}
                 onSelectInstance={setSelectedInstance}
+                onTerminate={handleTerminate}
               />
             </div>
 
@@ -132,31 +136,29 @@ export function InversionDeployer() {
               </Label>
             </div>
 
-            {/* Action Toolbar */}
-            <ActionToolbar
-              isLoggedIn={isLoggedIn}
-              hasSelectedInstance={!!selectedInstance}
-              repositoryHasImages={repositoryStatus?.hasImages ?? false}
-              onRoleLogin={() => setLoginDialogOpen(true)}
-              onRefresh={handleRefresh}
-              onDeploy={handleDeploy}
-              onTerminate={handleTerminate}
-              onConnect={handleConnect}
-            />
+            {/* Docker Image Upload - Show when repository is connected (even if empty) */}
+            {repositoryStatus?.exists && config.ecrRepository && (
+              <DockerImageUploadSection
+                config={config}
+                repositoryStatus={repositoryStatus}
+                onRepositoryStatusChange={() => {
+                  if (config.ecrRepository) {
+                    handleConnectRepository(config.ecrRepository, config.region);
+                  }
+                }}
+              />
+            )}
 
-            {/* Progress & Logs */}
-            <ProgressLogArea progress={progress} logs={logs} onClearLogs={clearLogs} />
-
-            {/* Docker Image Upload to ECR */}
-            <DockerImageUploadSection
-              config={config}
-              repositoryStatus={repositoryStatus}
-              onRepositoryStatusChange={() => {
-                if (config.ecrRepository) {
-                  handleConnectRepository(config.ecrRepository, config.region);
-                }
-              }}
-            />
+            {/* Instance Configuration - Show when repository has images (ready to deploy) */}
+            {repositoryStatus?.hasImages && config.ecrRepository && (
+              <InstanceConfigCard
+                config={config}
+                onConfigChange={updateConfig}
+                isLoggedIn={isLoggedIn}
+                repositoryHasImages={repositoryStatus?.hasImages ?? false}
+                onDeploy={handleDeploy}
+              />
+            )}
 
             {/* Container File Browser */}
             {selectedInstance && (
@@ -177,6 +179,9 @@ export function InversionDeployer() {
                 repository={config.ecrRepository}
               />
             )}
+
+            {/* Progress & Logs - Moved to bottom */}
+            <ProgressLogArea progress={progress} logs={logs} onClearLogs={clearLogs} />
 
             {/* Footer */}
             <footer className="flex items-center justify-center gap-4 border-t border-border pt-6 text-sm text-muted-foreground">
