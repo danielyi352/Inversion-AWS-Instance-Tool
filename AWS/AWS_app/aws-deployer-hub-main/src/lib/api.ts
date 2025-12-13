@@ -84,6 +84,59 @@ export function checkRepositoryStatus(repository: string, region: string = "us-e
   }>(`/repositories/${encodeURIComponent(repository)}/status?region=${encodeURIComponent(region)}`);
 }
 
+export function checkDockerAvailability() {
+  return apiFetch<{
+    available: boolean;
+    version: string | null;
+    daemon_running: boolean;
+    message: string;
+  }>("/docker/check");
+}
+
+export function pushImageToEcr(
+  repository: string,
+  tarFile: File,
+  imageTag: string = "latest",
+  region: string = "us-east-1"
+) {
+  const sessionId = getSessionId();
+  const formData = new FormData();
+  formData.append('repository', repository);
+  formData.append('image_tag', imageTag);
+  formData.append('region', region);
+  formData.append('tar_file', tarFile);
+
+  const headers: HeadersInit = {};
+  if (sessionId) {
+    headers['X-Session-ID'] = sessionId;
+  }
+
+  return fetch(`${API_BASE}/ecr/push-image`, {
+    method: 'POST',
+    headers,
+    body: formData,
+  }).then(async (res) => {
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(detail || res.statusText);
+    }
+    return res.json();
+  });
+}
+
+export function clearRepository(
+  repository: string,
+  region: string = "us-east-1"
+) {
+  return apiFetch<{
+    status: string;
+    message: string;
+    deletedCount: number;
+  }>(`/ecr/repositories/${repository}?region=${region}`, {
+    method: "DELETE",
+  });
+}
+
 export function deploy(config: AwsConfig & { accountId: string }) {
   // Session ID is automatically included via apiFetch
   return apiFetch<DeployResponse>("/deploy", {

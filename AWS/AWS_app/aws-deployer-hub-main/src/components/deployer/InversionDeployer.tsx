@@ -9,6 +9,7 @@ import { StatusCard } from './StatusCard';
 import { ActionToolbar } from './ActionToolbar';
 import { ProgressLogArea } from './ProgressLogArea';
 import { FileTransferSection } from './FileTransferSection';
+import { DockerImageUploadSection } from './DockerImageUploadSection';
 import { RoleLoginDialog } from './RoleLoginDialog';
 import { LogoutDialog } from './LogoutDialog';
 
@@ -146,6 +147,17 @@ export function InversionDeployer() {
 
             {/* Progress & Logs */}
             <ProgressLogArea progress={progress} logs={logs} onClearLogs={clearLogs} />
+
+            {/* Docker Image Upload to ECR */}
+            <DockerImageUploadSection
+              config={config}
+              repositoryStatus={repositoryStatus}
+              onRepositoryStatusChange={() => {
+                if (config.ecrRepository) {
+                  handleConnectRepository(config.ecrRepository, config.region);
+                }
+              }}
+            />
 
             {/* File Transfer */}
             <FileTransferSection

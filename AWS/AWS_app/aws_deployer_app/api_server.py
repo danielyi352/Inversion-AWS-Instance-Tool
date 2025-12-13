@@ -26,6 +26,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import paramiko
 
+# Import docker routes
+from docker_routes import router as docker_router
+
 # ------------------------------------------------------------------------------
 # FastAPI setup
 # ------------------------------------------------------------------------------
@@ -40,6 +43,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include docker routes
+app.include_router(docker_router)
 
 
 # ------------------------------------------------------------------------------
@@ -101,6 +107,8 @@ class DownloadRequest(BaseModel):
     remote_path: str
     local_path: str
     container_name: Optional[str] = Field(None, description="Container name if downloading from container")
+
+
 
 
 # ------------------------------------------------------------------------------
@@ -656,8 +664,9 @@ def _wait_for_ssm(ssm_client, instance_id: str, log_callback=None, max_retries: 
         if attempt < max_retries - 1:
             time.sleep(10)
     
-        raise HTTPException(
-            status_code=500,
+    # If we get here, all retries failed
+    raise HTTPException(
+        status_code=500,
         detail=f"SSM connection failed after {max_retries * 10} seconds. Instance may still be initializing. Ensure the instance has an IAM role with SSM permissions."
     )
 
@@ -761,15 +770,23 @@ echo "AWS credentials configured"
 
 
 def _pull_and_run_container(ssm_client, instance_id: str, ecr_registry: str, repository: str,
-                           image_tag: str, account_id: str, region: str, log_callback=None):
+                           image_tag: str, account_id: str, region: str, instance_type: str = None, log_callback=None):
     """Pull Docker image from ECR and run container via SSM."""
     if log_callback:
         log_callback(_log_message(f"Pulling {repository} container from ECR and starting it..."))
     
-    # Detect GPU vs CPU
+    # Detect GPU vs CPU - only use GPU if:
+    # 1. Repository name doesn't contain 'cpu'
+    # 2. Instance type is a GPU instance (contains 'g' or 'p' for GPU instance families)
     repo_lower = repository.lower()
-    target_gpu = 0 if 'cpu' in repo_lower else 1
-    gpu_flag = "--gpus all" if target_gpu == 1 else ""
+    instance_lower = (instance_type or "").lower()
+    
+    # GPU instance families: g3, g4dn, g5, p2, p3, p4d, p5, inf1, inf2, trn1
+    is_gpu_instance = any(gpu_family in instance_lower for gpu_family in ['g3', 'g4', 'g5', 'p2', 'p3', 'p4', 'p5', 'inf1', 'inf2', 'trn1'])
+    is_cpu_repo = 'cpu' in repo_lower
+    
+    # Only use GPU flag if it's a GPU instance AND not a CPU repository
+    gpu_flag = "--gpus all" if (is_gpu_instance and not is_cpu_repo) else ""
     
     container_name = f"{account_id}-{repository}-container"
     full_image_name = f"{ecr_registry}/{repository}:{image_tag}"
@@ -790,11 +807,10 @@ echo "Container started"
         if "manifest unknown" in error_msg or "Requested image not found" in error_msg:
             raise HTTPException(
                 status_code=404,
-                detail=f"Docker image not found in ECR. The repository '{repository}' appears to be empty. Please push an image to ECR first:\n\n"
+                detail=f"Docker image not found in ECR. The repository '{repository}' appears to be empty. Please push an image to ECR using the Docker Image Upload section in the UI, or manually:\n\n"
                        f"1. Build your Docker image: docker build -t {repository} .\n"
-                       f"2. Tag it: docker tag {repository}:latest {full_image_name}\n"
-                       f"3. Login to ECR: aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {ecr_registry}\n"
-                       f"4. Push: docker push {full_image_name}\n\n"
+                       f"2. Export to tar: docker save {repository}:latest -o {repository}.tar\n"
+                       f"3. Upload the tar file through the UI's Docker Image Upload section\n\n"
                        f"Original error: {error_msg}"
             )
         raise HTTPException(status_code=500, detail=f"Container deployment failed: {error_msg}")
@@ -860,18 +876,18 @@ def _deploy_with_boto3(req: DeployRequestModel, session_creds: Optional[Dict[str
         
         # Step 7: Pull and run container
         ecr_registry = f"{req.account_id}.dkr.ecr.{req.region}.amazonaws.com"
-        _pull_and_run_container(ssm_client, instance_id, ecr_registry, req.repository, "latest", req.account_id, req.region, log)
+        _pull_and_run_container(ssm_client, instance_id, ecr_registry, req.repository, "latest", req.account_id, req.region, req.instance_type, log)
         
         log("Deployment completed successfully!")
 
         return {
-            "instance": {
-                "id": instance_id,
-                "publicDns": public_dns,
-                "instanceType": req.instance_type,
-            },
-            "logs": logs,
-        }
+        "instance": {
+            "id": instance_id,
+            "publicDns": public_dns,
+            "instanceType": req.instance_type,
+        },
+        "logs": logs,
+    }
     except HTTPException:
         raise
     except Exception as e:
@@ -1054,9 +1070,9 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
         security_groups = []
         try:
             security_groups = [
-                s["GroupName"]
-                for s in ec2.describe_security_groups().get("SecurityGroups", [])
-            ]
+            s["GroupName"]
+            for s in ec2.describe_security_groups().get("SecurityGroups", [])
+        ]
         except ClientError as sg_exc:
             error_code = sg_exc.response.get('Error', {}).get('Code', 'Unknown')
             print(f"[WARNING] EC2 describe_security_groups error: {error_code}")
@@ -1155,25 +1171,28 @@ def repository_status(
         # List images in repository
         try:
             images_response = ecr.list_images(repositoryName=repository)
-            images = images_response.get('imageIds', [])
+            all_images = images_response.get('imageIds', [])
+            
+            # Filter to only show tagged images (exclude untagged layers/manifests)
+            tagged_images = [img for img in all_images if img.get('imageTag')]
             
             # Get image details (tags, pushed date, etc.)
-            if images:
+            if tagged_images:
                 image_details = []
-                for image_id in images:
+                for image_id in tagged_images:
                     detail = {
                         "imageDigest": image_id.get('imageDigest', ''),
-                        "imageTag": image_id.get('imageTag', 'untagged'),
+                        "imageTag": image_id.get('imageTag'),
                     }
                     image_details.append(detail)
                 
                 return {
                     "exists": True,
                     "hasImages": True,
-                    "imageCount": len(images),
+                    "imageCount": len(tagged_images),  # Count only tagged images
                     "images": image_details,
                     "repositoryUri": repo_uri,
-                    "message": f"Repository has {len(images)} image(s)"
+                    "message": f"Repository has {len(tagged_images)} tagged image(s)"
                 }
             else:
                 return {
@@ -1182,7 +1201,7 @@ def repository_status(
                     "imageCount": 0,
                     "images": [],
                     "repositoryUri": repo_uri,
-                    "message": "Repository exists but is empty"
+                    "message": "Repository exists but has no tagged images"
                 }
         except ClientError as e:
             error_code = e.response.get('Error', {}).get('Code', '')
@@ -1359,7 +1378,15 @@ def deploy_stream(
                 result = _deploy_with_boto3(req, session_creds, log_callback=log_callback)
                 instance_id = result["instance"]["id"]
                 public_dns = result["instance"]["publicDns"]
-                logs_queue.put(("success", {"instanceId": instance_id, "publicDns": public_dns}))
+                instance_type = result["instance"]["instanceType"]
+                # Frontend expects "complete" event with instance object
+                logs_queue.put(("complete", {
+                    "instance": {
+                        "id": instance_id,
+                        "publicDns": public_dns,
+                        "instanceType": instance_type
+                    }
+                }))
             except HTTPException as e:
                 deployment_error = e
                 logs_queue.put(("error", str(e.detail)))
@@ -1380,6 +1407,8 @@ def deploy_stream(
                 try:
                     item = logs_queue.get(timeout=1)
                     if item is None:  # Sentinel
+                        # Wait a moment to ensure all messages are processed
+                        time.sleep(0.5)
                         break
                     
                     event_type, data = item
@@ -1392,8 +1421,15 @@ def deploy_stream(
                             if text in lower:
                                 yield _sse("progress", pct)
                                 break
+                    elif event_type == "complete":
+                        yield _sse("complete", data)
+                        # Wait a moment to ensure the complete event is sent before closing
+                        time.sleep(0.5)
+                        break
                     elif event_type == "success":
-                        yield _sse("success", data)
+                        # Legacy support - convert to complete
+                        yield _sse("complete", data)
+                        time.sleep(0.5)
                         break
                     elif event_type == "error":
                         yield _sse("error", data)
@@ -1401,11 +1437,38 @@ def deploy_stream(
                 except queue.Empty:
                     # Check if deployment thread is still alive
                     if not deploy_thread.is_alive() and deployment_done:
+                        # If thread is done but we didn't get a success/error event, something went wrong
+                        # Wait a bit more to see if we get a final message
+                        try:
+                            item = logs_queue.get(timeout=0.5)
+                            if item and item[0] == "complete":
+                                yield _sse("complete", item[1])
+                            elif item and item[0] == "success":
+                                # Legacy support
+                                yield _sse("complete", item[1])
+                            elif item and item[0] == "error":
+                                yield _sse("error", item[1])
+                        except queue.Empty:
+                            # No more messages, deployment might have completed silently
+                            if instance_id:
+                                # Try to send complete with whatever instance info we have
+                                yield _sse("complete", {
+                                    "instance": {
+                                        "id": instance_id,
+                                        "publicDns": public_dns or "",
+                                        "instanceType": req.instance_type
+                                    }
+                                })
                         break
                     continue
         except GeneratorExit:
             # Client disconnected, cleanup if needed
             pass
+        except Exception as e:
+            # Log any unexpected errors but don't fail silently
+            import traceback
+            print(f"Error in event stream: {e}\n{traceback.format_exc()}")
+            yield _sse("error", f"Stream error: {str(e)}")
         finally:
             # Cleanup: try to terminate instance if deployment failed and instance was created
             if deployment_error and instance_id:
