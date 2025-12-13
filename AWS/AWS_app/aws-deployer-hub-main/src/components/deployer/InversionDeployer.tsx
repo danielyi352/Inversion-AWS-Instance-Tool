@@ -8,8 +8,9 @@ import { AwsConfigCard } from './AwsConfigCard';
 import { StatusCard } from './StatusCard';
 import { ActionToolbar } from './ActionToolbar';
 import { ProgressLogArea } from './ProgressLogArea';
-import { FileTransferSection } from './FileTransferSection';
 import { DockerImageUploadSection } from './DockerImageUploadSection';
+import { ContainerFileBrowser } from './ContainerFileBrowser';
+import { ContainerLogsViewer } from './ContainerLogsViewer';
 import { RoleLoginDialog } from './RoleLoginDialog';
 import { LogoutDialog } from './LogoutDialog';
 
@@ -38,8 +39,6 @@ export function InversionDeployer() {
     handleDeploy,
     handleTerminate,
     handleConnect,
-    handleUpload,
-    handleDownload,
     handleLogout,
   } = useAwsConfig();
 
@@ -159,12 +158,25 @@ export function InversionDeployer() {
               }}
             />
 
-            {/* File Transfer */}
-            <FileTransferSection
-              isConnected={isLoggedIn && !!selectedInstance}
-              onUpload={handleUpload}
-              onDownload={handleDownload}
-            />
+            {/* Container File Browser */}
+            {selectedInstance && (
+              <ContainerFileBrowser
+                instanceId={selectedInstance}
+                region={config.region}
+                accountId={config.accountId}
+                repository={config.ecrRepository}
+              />
+            )}
+
+            {/* Container Logs Viewer */}
+            {selectedInstance && (
+              <ContainerLogsViewer
+                instanceId={selectedInstance}
+                region={config.region}
+                accountId={config.accountId}
+                repository={config.ecrRepository}
+              />
+            )}
 
             {/* Footer */}
             <footer className="flex items-center justify-center gap-4 border-t border-border pt-6 text-sm text-muted-foreground">

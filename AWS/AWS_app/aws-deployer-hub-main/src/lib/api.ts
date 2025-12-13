@@ -25,10 +25,27 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     
     if (!res.ok) {
       const detail = await res.text();
+      
+      // Check for session expiration (401 status or session-related errors)
+      if (res.status === 401 || detail.includes('Invalid or expired session') || detail.includes('Session expired')) {
+        // Clear expired session
+        localStorage.removeItem('aws_session_id');
+        // Throw a specific error that can be caught by components
+        const sessionError = new Error('SESSION_EXPIRED');
+        (sessionError as any).isSessionExpired = true;
+        (sessionError as any).originalMessage = detail;
+        throw sessionError;
+      }
+      
       throw new Error(detail || res.statusText);
     }
     return res.json();
   } catch (error) {
+    // Re-throw session expiration errors as-is
+    if (error instanceof Error && (error as any).isSessionExpired) {
+      throw error;
+    }
+    
     // Provide more helpful error messages
     if (error instanceof TypeError && error.message === 'Failed to fetch') {
       throw new Error(
@@ -220,24 +237,212 @@ export function uploadFile(
   });
 }
 
-export function downloadFile(
+export async function downloadFile(
   region: string,
   instanceId: string,
   remotePath: string,
-  localPath: string,
-  keyPath?: string,
+  containerName?: string,
+  repository?: string,
+  accountId?: string,
 ) {
-  // Session ID is automatically included via apiFetch
-  return apiFetch<{ status: string; message?: string }>("/download", {
+  const sessionId = getSessionId();
+  const headers: HeadersInit = { "Content-Type": "application/json" };
+  
+  if (sessionId) {
+    headers["X-Session-ID"] = sessionId;
+  }
+
+  const response = await fetch(`${API_BASE}/download`, {
     method: "POST",
+    headers,
     body: JSON.stringify({
       profile: "",
       region,
       instance_id: instanceId,
       remote_path: remotePath,
-      local_path: localPath,
-      key_path: keyPath,
+      local_path: "", // Not used anymore - file is returned directly
+      container_name: containerName,
+      repository: repository,
+      account_id: accountId,
     }),
   });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    
+    // Check for session expiration (401 status or session-related errors)
+    if (response.status === 401 || detail.includes('Invalid or expired session') || detail.includes('Session expired')) {
+      // Clear expired session
+      localStorage.removeItem('aws_session_id');
+      // Throw a specific error that can be caught by components
+      const sessionError = new Error('SESSION_EXPIRED');
+      (sessionError as any).isSessionExpired = true;
+      (sessionError as any).originalMessage = detail;
+      throw sessionError;
+    }
+    
+    throw new Error(detail || response.statusText);
+  }
+
+  // Get filename from Content-Disposition header or use remote path
+  const contentDisposition = response.headers.get('Content-Disposition');
+  let filename = remotePath.split('/').pop() || 'download';
+  if (contentDisposition) {
+    const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+    if (filenameMatch) {
+      filename = filenameMatch[1];
+    }
+  }
+
+  // Create blob and trigger download
+  const blob = await response.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+
+  return { status: "ok", message: `Downloaded ${filename}` };
+}
+
+export interface FileItem {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size: number;
+  permissions: string;
+}
+
+export function listFiles(
+  region: string,
+  instanceId: string,
+  path: string = "/",
+  containerName?: string,
+  repository?: string,
+  accountId?: string,
+) {
+  // Session ID is automatically included via apiFetch
+  return apiFetch<{
+    status: string;
+    path: string;
+    containerName?: string;
+    files: FileItem[];
+  }>("/list-files", {
+    method: "POST",
+    body: JSON.stringify({
+      profile: "",
+      region,
+      instance_id: instanceId,
+      path: path,
+      container_name: containerName,
+      repository: repository,
+      account_id: accountId,
+    }),
+  });
+}
+
+export interface ContainerLogsResponse {
+  status: string;
+  containerName: string;
+  logs: string;
+  isRunning: boolean;
+  containerStatus: string;
+  lineCount: number;
+}
+
+export function getContainerLogs(
+  region: string,
+  instanceId: string,
+  tail: number = 100,
+  containerName?: string,
+  repository?: string,
+  accountId?: string,
+) {
+  // Session ID is automatically included via apiFetch
+  return apiFetch<ContainerLogsResponse>("/container-logs", {
+    method: "POST",
+    body: JSON.stringify({
+      profile: "",
+      region,
+      instance_id: instanceId,
+      container_name: containerName,
+      repository: repository,
+      account_id: accountId,
+      tail: tail,
+      follow: false,
+    }),
+  });
+}
+
+export async function downloadContainerLogs(
+  region: string,
+  instanceId: string,
+  tail: number = 10000,
+  containerName?: string,
+  repository?: string,
+  accountId?: string,
+) {
+  const sessionId = getSessionId();
+  const headers: HeadersInit = { "Content-Type": "application/json" };
+  
+  if (sessionId) {
+    headers["X-Session-ID"] = sessionId;
+  }
+
+  const response = await fetch(`${API_BASE}/container-logs/download`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      profile: "",
+      region,
+      instance_id: instanceId,
+      container_name: containerName,
+      repository: repository,
+      account_id: accountId,
+      tail: tail,
+      follow: false,
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    
+    // Check for session expiration
+    if (response.status === 401 || detail.includes('Invalid or expired session') || detail.includes('Session expired')) {
+      localStorage.removeItem('aws_session_id');
+      const sessionError = new Error('SESSION_EXPIRED');
+      (sessionError as any).isSessionExpired = true;
+      (sessionError as any).originalMessage = detail;
+      throw sessionError;
+    }
+    
+    throw new Error(detail || response.statusText);
+  }
+
+  // Get filename from Content-Disposition header
+  const contentDisposition = response.headers.get('Content-Disposition');
+  let filename = `container_logs_${Date.now()}.log`;
+  if (contentDisposition) {
+    const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+    if (filenameMatch) {
+      filename = filenameMatch[1];
+    }
+  }
+
+  // Create blob and trigger download
+  const blob = await response.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+
+  return { status: "ok", message: `Downloaded logs as ${filename}` };
 }
 
