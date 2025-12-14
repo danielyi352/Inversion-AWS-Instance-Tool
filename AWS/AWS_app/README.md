@@ -51,8 +51,7 @@ conda env create -f environment.yml
 # Activate the environment
 conda activate aws-deployer
 
-# Install additional pip dependencies (if needed)
-pip install -r requirements.txt  # if you have one, or install manually
+# Note: All dependencies are included in environment.yml
 ```
 
 #### Option B: Using pip/virtualenv
@@ -67,8 +66,8 @@ venv\Scripts\activate
 # On macOS/Linux:
 source venv/bin/activate
 
-# Install dependencies
-pip install fastapi uvicorn[standard] boto3 botocore pydantic python-dotenv paramiko
+# Install dependencies from requirements.txt
+pip install -r requirements.txt
 ```
 
 ### 3. Frontend Setup (React/Vite)
@@ -85,11 +84,13 @@ npm install
 
 ### 4. Environment Configuration
 
-Create a `.env` file in the `AWS_app` directory for AWS credentials:
+Create a `.env` file in the `aws_deployer_app` directory for AWS credentials:
 
 ```bash
-cd AWS_app
+cd aws_deployer_app
 touch .env
+# On Windows:
+# type nul > .env
 ```
 
 Add your AWS credentials to `.env`:
@@ -204,6 +205,7 @@ AWS_app/
 │   └── package.json
 │
 ├── environment.yml             # Conda environment definition
+├── requirements.txt           # Python dependencies for pip users
 └── README.md                  # This file
 ```
 
