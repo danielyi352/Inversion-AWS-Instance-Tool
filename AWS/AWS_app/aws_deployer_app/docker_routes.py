@@ -15,16 +15,16 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
 router = APIRouter(prefix="/api", tags=["docker"])
 
 
-def _get_session_credentials_from_api_server(session_id):
-    """Import and call session credentials function from api_server to avoid circular imports."""
-    from api_server import _get_session_credentials
-    return _get_session_credentials(session_id)
+def _get_session_credentials_from_auth(session_id):
+    """Import and call session credentials function from auth_routes."""
+    from auth_routes import get_session_credentials
+    return get_session_credentials(session_id)
 
 
-def _session_from_credentials_from_api_server(credentials, region):
-    """Import and call session creation function from api_server to avoid circular imports."""
-    from api_server import _session_from_credentials
-    return _session_from_credentials(credentials, region)
+def _session_from_credentials_from_auth(credentials, region):
+    """Import and call session creation function from auth_routes."""
+    from auth_routes import session_from_credentials
+    return session_from_credentials(credentials, region)
 
 
 def check_docker_availability():
@@ -112,10 +112,10 @@ async def push_image_to_ecr(
         raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
     
     try:
-        creds = _get_session_credentials_from_api_server(session_id)
+        creds = _get_session_credentials_from_auth(session_id)
         # Use region from form, fallback to session region
         region = region or creds.get('region', 'us-east-1')
-        session = _session_from_credentials_from_api_server(creds, region)
+        session = _session_from_credentials_from_auth(creds, region)
         account_id = creds.get('account_id', '')
     except HTTPException as e:
         raise
@@ -341,14 +341,14 @@ async def clear_repository(
         raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
     
     try:
-        creds = _get_session_credentials_from_api_server(session_id)
+        creds = _get_session_credentials_from_auth(session_id)
         # Use region from query parameter if provided, fallback to session region
         query_region = request.query_params.get("region")
         if query_region:
             region = query_region
         else:
             region = region or creds.get('region', 'us-east-1')
-        session = _session_from_credentials_from_api_server(creds, region)
+        session = _session_from_credentials_from_auth(creds, region)
     except HTTPException as e:
         raise
     

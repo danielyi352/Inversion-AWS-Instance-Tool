@@ -65,14 +65,51 @@ export function loginSso(profile: string, region: string) {
   });
 }
 
+export function cloudformationLogin(accountId: string, region: string) {
+  return apiFetch<{
+    status: string;
+    account_id: string;
+    region: string;
+    stack_name: string;
+    cloudformation_console_url: string;
+    template_s3_url: string;
+    role_arn_format: string;
+    instructions: string;
+  }>("/auth/cloudformation/login", {
+    method: "POST",
+    body: JSON.stringify({
+      account_id: accountId,
+      region: region,
+    }),
+  });
+}
+
+export function cloudformationVerify(accountId: string, region: string) {
+  return apiFetch<{
+    status: string;
+    session_id: string;
+    expires_at: string;
+    account_id: string;
+    role_arn: string;
+    message: string;
+    attempt: number;
+  }>("/auth/cloudformation/verify", {
+    method: "POST",
+    body: JSON.stringify({
+      account_id: accountId,
+      region: region,
+    }),
+  });
+}
+
 export function assumeRoleLogin(request: AssumeRoleLoginRequest) {
   return apiFetch<AssumeRoleLoginResponse>("/auth/assume-role", {
     method: "POST",
     body: JSON.stringify({
       role_arn: request.roleArn,
+      account_id: request.accountId,
       external_id: request.externalId,
       region: request.region,
-      session_name: request.sessionName || "inversion-deployer-session",
     }),
   });
 }

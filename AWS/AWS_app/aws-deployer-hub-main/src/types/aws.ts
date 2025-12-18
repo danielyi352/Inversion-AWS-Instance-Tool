@@ -61,9 +61,9 @@ export interface DeployStreamEvent {
 
 export interface AssumeRoleLoginRequest {
   roleArn: string;
+  accountId: string;
   externalId?: string;
   region: string;
-  sessionName?: string;
 }
 
 export interface AssumeRoleLoginResponse {

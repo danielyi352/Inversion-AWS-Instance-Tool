@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates an IAM role for Inversion Deployer that allows the backend service to assume it"
+
+Parameters:
+  TrustARN:
+    Type: String
+    Description: ARN of the AWS user or role that will assume this role (e.g., arn:aws:iam::123456789012:user/username or arn:aws:iam::123456789012:root)
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:(root|user/.+|role/.+)$"
+
+  ExternalId:
+    Type: String
+    Description: External ID for additional security (optional, leave empty if not needed)
+    Default: ""
+    NoEcho: false
+
+Resources:
+  InversionDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: InversionDeployerRole
+      Description: "IAM role for Inversion Deployer - allows backend service to manage EC2, ECR, SSM, and S3 resources"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref TrustARN
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !If
+                  - HasExternalId
+                  - !Ref ExternalId
+                  - !Ref "AWS::NoValue"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess
+      Policies:
+        - PolicyName: InversionDeployerInstanceRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:CreateInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:PassRole
+                  - iam:GetRole
+                  - iam:GetInstanceProfile
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/inversion-deployer-instance-role-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/inversion-deployer-instance-role-*"
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Outputs:
+  RoleArn:
+    Description: "ARN of the IAM role that can be assumed by the backend service"
+    Value: !GetAtt InversionDeployerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
+
+  RoleName:
+    Description: "Name of the IAM role"
+    Value: !Ref InversionDeployerRole
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleName"

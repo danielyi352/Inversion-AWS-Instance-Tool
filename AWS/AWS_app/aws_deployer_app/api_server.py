@@ -10,12 +10,10 @@ import os
 import subprocess
 import sys
 import shlex
-import uuid
 import time
 import base64
 import json
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Generator
 
 import boto3
@@ -26,10 +24,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import paramiko
 
-# Import docker routes
+# Import routers
 from docker_routes import router as docker_router
-# Import file transfer routes
 from file_transfer_routes import router as file_transfer_router
+from auth_routes import router as auth_router, get_session_credentials, session_from_credentials
 
 # ------------------------------------------------------------------------------
 # FastAPI setup
@@ -46,9 +44,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include docker routes
+# Include routers
+app.include_router(auth_router)
 app.include_router(docker_router)
-# Include file transfer routes
 app.include_router(file_transfer_router)
 
 
@@ -57,16 +55,6 @@ app.include_router(file_transfer_router)
 # ------------------------------------------------------------------------------
 
 
-class LoginRequest(BaseModel):
-    profile: str = Field(default="default")
-    region: str = Field(default="us-east-1")
-
-
-class AssumeRoleLoginRequest(BaseModel):
-    role_arn: str = Field(..., description="IAM Role ARN to assume")
-    external_id: Optional[str] = Field(None, description="External ID for security (optional)")
-    region: str = Field(default="us-east-1")
-    session_name: str = Field(default="inversion-deployer-session")
 
 
 class DeployRequestModel(BaseModel):
@@ -106,134 +94,9 @@ class ConnectRequest(BaseModel):
 
 
 # ------------------------------------------------------------------------------
-# Session Management
+# Session Management (imported from auth_routes)
 # ------------------------------------------------------------------------------
-
-# In-memory session storage (use Redis/database in production)
-sessions: Dict[str, Dict[str, Any]] = {}
-
-
-def _get_your_aws_credentials():
-    """
-    Get your AWS account credentials for assuming roles.
-    
-    Tries multiple secure methods in order:
-    1. Environment variables (YOUR_AWS_ACCESS_KEY_ID, YOUR_AWS_SECRET_ACCESS_KEY)
-    2. AWS Secrets Manager (if SECRET_NAME env var is set)
-    3. AWS Systems Manager Parameter Store (if PARAMETER_NAME env var is set)
-    4. .env file (for development, requires python-dotenv)
-    
-    Returns:
-        Tuple[str, str]: (access_key_id, secret_access_key)
-    
-    Raises:
-        HTTPException: If credentials cannot be found
-    """
-    access_key = None
-    secret_key = None
-    
-    # Method 1: Environment variables (highest priority)
-    access_key = os.environ.get("YOUR_AWS_ACCESS_KEY_ID")
-    secret_key = os.environ.get("YOUR_AWS_SECRET_ACCESS_KEY")
-    
-    if access_key and secret_key:
-        return access_key, secret_key
-    
-    # Method 2: AWS Secrets Manager
-    secret_name = os.environ.get("AWS_SECRET_NAME")
-    if secret_name:
-        try:
-            import json
-            secrets_client = boto3.client('secretsmanager')
-            response = secrets_client.get_secret_value(SecretId=secret_name)
-            secret_data = json.loads(response['SecretString'])
-            access_key = secret_data.get('YOUR_AWS_ACCESS_KEY_ID') or secret_data.get('access_key_id')
-            secret_key = secret_data.get('YOUR_AWS_SECRET_ACCESS_KEY') or secret_data.get('secret_access_key')
-            if access_key and secret_key:
-                return access_key, secret_key
-        except Exception as e:
-            # Log but continue to next method
-            print(f"Warning: Failed to get credentials from Secrets Manager: {e}")
-    
-    # Method 3: AWS Systems Manager Parameter Store
-    param_name = os.environ.get("AWS_PARAMETER_NAME")
-    if param_name:
-        try:
-            import json
-            ssm_client = boto3.client('ssm')
-            response = ssm_client.get_parameter(Name=param_name, WithDecryption=True)
-            param_data = json.loads(response['Parameter']['Value'])
-            access_key = param_data.get('YOUR_AWS_ACCESS_KEY_ID') or param_data.get('access_key_id')
-            secret_key = param_data.get('YOUR_AWS_SECRET_ACCESS_KEY') or param_data.get('secret_access_key')
-            if access_key and secret_key:
-                return access_key, secret_key
-        except Exception as e:
-            # Log but continue to next method
-            print(f"Warning: Failed to get credentials from Parameter Store: {e}")
-    
-    # Method 4: .env file (for development)
-    try:
-        from dotenv import load_dotenv
-        # Load .env file if it exists
-        env_path = Path(__file__).parent.parent / '.env'
-        if env_path.exists():
-            load_dotenv(env_path)
-            access_key = os.environ.get("YOUR_AWS_ACCESS_KEY_ID")
-            secret_key = os.environ.get("YOUR_AWS_SECRET_ACCESS_KEY")
-            if access_key and secret_key:
-                return access_key, secret_key
-    except ImportError:
-        # python-dotenv not installed, skip
-        pass
-    except Exception as e:
-        print(f"Warning: Failed to load .env file: {e}")
-    
-    # If we get here, no credentials were found
-    raise HTTPException(
-        status_code=500,
-        detail=(
-            "Server configuration error: AWS credentials not configured.\n"
-            "Please set credentials using one of these methods:\n"
-            "1. Environment variables: YOUR_AWS_ACCESS_KEY_ID and YOUR_AWS_SECRET_ACCESS_KEY\n"
-            "2. AWS Secrets Manager: Set AWS_SECRET_NAME environment variable\n"
-            "3. AWS Parameter Store: Set AWS_PARAMETER_NAME environment variable\n"
-            "4. .env file: Create .env file in project root (requires python-dotenv)"
-        )
-    )
-
-
-def _get_session_credentials(session_id: Optional[str]) -> Dict[str, Any]:
-    """Get credentials from session, raise error if invalid/expired."""
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session ID provided")
-    
-    session = sessions.get(session_id)
-    if not session:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
-    
-    expiration = datetime.fromisoformat(session['expiration'])
-    # Use timezone-aware datetime for comparison (AWS returns UTC timestamps)
-    now = datetime.now(timezone.utc)
-    # Ensure expiration is timezone-aware (if it's not already)
-    if expiration.tzinfo is None:
-        expiration = expiration.replace(tzinfo=timezone.utc)
-    
-    if expiration < now:
-        # Clean up expired session
-        sessions.pop(session_id, None)
-        raise HTTPException(status_code=401, detail="Session expired. Please login again.")
-    
-    return session
-
-
-def _session_from_credentials(credentials: Dict[str, Any], region: str):
-    """Create boto3 session from stored credentials."""
-    return boto3.Session(
-        aws_access_key_id=credentials['access_key_id'],
-        aws_secret_access_key=credentials['secret_access_key'],
-        aws_session_token=credentials['session_token'],
-        region_name=region
-    )
+# Session management functions are imported from auth_routes module
 
 
 # ------------------------------------------------------------------------------
@@ -1000,77 +863,7 @@ def _describe_instance_dns_with_session(session: boto3.Session, region: str, ins
 # ------------------------------------------------------------------------------
 
 
-@app.post("/api/auth/assume-role")
-def assume_role_login(body: AssumeRoleLoginRequest):
-    """Login by assuming an IAM role in the user's AWS account."""
-    try:
-        # Get your AWS credentials (for assuming the role)
-        your_access_key, your_secret_key = _get_your_aws_credentials()
-        
-        # Create STS client with your credentials
-        sts = boto3.client(
-            'sts',
-            aws_access_key_id=your_access_key,
-            aws_secret_access_key=your_secret_key,
-            region_name=body.region
-        )
-        
-        # Prepare assume role parameters
-        assume_role_params = {
-            'RoleArn': body.role_arn,
-            'RoleSessionName': f"{body.session_name}-{uuid.uuid4().hex[:8]}",
-            'DurationSeconds': 3600,  # 1 hour
-        }
-        
-        # Add ExternalId if provided (recommended for security)
-        if body.external_id:
-            assume_role_params['ExternalId'] = body.external_id
-        
-        # Assume the role
-        response = sts.assume_role(**assume_role_params)
-        
-        credentials = response['Credentials']
-        
-        # Extract account ID from the assumed role ARN
-        account_id = body.role_arn.split(':')[4]
-        
-        # Store in session
-        session_id = str(uuid.uuid4())
-        sessions[session_id] = {
-            'access_key_id': credentials['AccessKeyId'],
-            'secret_access_key': credentials['SecretAccessKey'],
-            'session_token': credentials['SessionToken'],
-            'expiration': credentials['Expiration'].isoformat(),
-            'region': body.region,
-            'role_arn': body.role_arn,
-            'account_id': account_id,
-        }
-        
-        return {
-            "status": "ok",
-            "session_id": session_id,
-            "expires_at": credentials['Expiration'].isoformat(),
-            "account_id": account_id,
-            "message": f"Successfully assumed role in account {account_id}"
-        }
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-        error_msg = e.response.get('Error', {}).get('Message', str(e))
-        raise HTTPException(
-            status_code=401,
-            detail=f"Failed to assume role: {error_code} - {error_msg}. Please verify the role ARN and trust relationship."
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-
-@app.post("/api/sso/login")
-def sso_login(body: LoginRequest):
-    """Trigger AWS SSO login for the given profile/region (legacy)."""
-    output = _run(
-        ["aws", "sso", "login", "--profile", body.profile, "--region", body.region]
-    )
-    return {"status": "ok", "message": output}
+# Authentication routes moved to auth_routes.py
 
 
 @app.get("/api/metadata")
@@ -1082,7 +875,7 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
     if session_id:
         try:
             # Use assumed role credentials
-            creds = _get_session_credentials(session_id)
+            creds = get_session_credentials(session_id)
             # Use region from query parameter if explicitly provided, otherwise use session region
             query_region = request.query_params.get("region")
             if query_region:
@@ -1090,7 +883,7 @@ def metadata(request: Request, profile: Optional[str] = None, region: str = "us-
             else:
                 # No region in query params, use session's region
                 region = creds.get('region', region)
-            session = _session_from_credentials(creds, region)
+            session = session_from_credentials(creds, region)
         except HTTPException as e:
             # Re-raise HTTP exceptions (401, etc.) as-is
             raise
@@ -1186,14 +979,14 @@ def repository_status(
         raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
     
     try:
-        creds = _get_session_credentials(session_id)
+        creds = get_session_credentials(session_id)
         # Use region from query parameter if explicitly provided, otherwise use session region
         query_region = request.query_params.get("region")
         if query_region:
             region = query_region
         else:
             region = creds.get('region', region)
-        session = _session_from_credentials(creds, region)
+        session = session_from_credentials(creds, region)
         account_id = creds.get('account_id', '')
     except HTTPException as e:
         raise
@@ -1304,7 +1097,7 @@ def instances(request: Request, profile: Optional[str] = None, region: str = "us
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials(session_id)
+        creds = get_session_credentials(session_id)
         # Use region from query parameter if explicitly provided, otherwise use session region
         query_region = request.query_params.get("region")
         if query_region:
@@ -1312,7 +1105,7 @@ def instances(request: Request, profile: Optional[str] = None, region: str = "us
         else:
             # No region in query params, use session's region
             region = creds.get('region', region)
-        session = _session_from_credentials(creds, region)
+        session = session_from_credentials(creds, region)
     elif profile:
         # Legacy: use profile-based auth
         session = _session(profile, region)
@@ -1369,7 +1162,7 @@ def deploy(request: Request, body: DeployRequestModel):
     session_creds = None
     
     if session_id:
-        session_creds = _get_session_credentials(session_id)
+        session_creds = get_session_credentials(session_id)
         # Override account_id from session if available
         if 'account_id' in session_creds:
             body.account_id = session_creds['account_id']
@@ -1406,7 +1199,7 @@ def deploy_stream(
     session_creds = None
     
     if session_id:
-        session_creds = _get_session_credentials(session_id)
+        session_creds = get_session_credentials(session_id)
         # Use account_id and region from session
         if not account_id and 'account_id' in session_creds:
             account_id = session_creds['account_id']
@@ -1581,8 +1374,8 @@ def terminate(request: Request, body: TerminateRequest):
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials(session_id)
-        session = _session_from_credentials(creds, body.region)
+        creds = get_session_credentials(session_id)
+        session = session_from_credentials(creds, body.region)
     elif body.profile:
         # Legacy: use profile-based auth
         session = _session(body.profile, body.region)
@@ -1604,8 +1397,8 @@ def connect(request: Request, body: ConnectRequest):
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials(session_id)
-        session = _session_from_credentials(creds, body.region)
+        creds = get_session_credentials(session_id)
+        session = session_from_credentials(creds, body.region)
         public_dns = _describe_instance_dns_with_session(session, body.region, body.instance_id)
     elif body.profile:
         # Legacy: use profile-based auth

@@ -11,7 +11,7 @@ import { ProgressLogArea } from './ProgressLogArea';
 import { DockerImageUploadSection } from './DockerImageUploadSection';
 import { ContainerFileBrowser } from './ContainerFileBrowser';
 import { ContainerLogsViewer } from './ContainerLogsViewer';
-import { RoleLoginDialog } from './RoleLoginDialog';
+import { AwsConnectionDialog } from './AwsConnectionDialog';
 import { LogoutDialog } from './LogoutDialog';
 
 export function InversionDeployer() {
@@ -202,8 +202,8 @@ export function InversionDeployer() {
           </div>
         )}
 
-        {/* Login Dialog */}
-        <RoleLoginDialog
+        {/* AWS Connection Dialog */}
+        <AwsConnectionDialog
           open={loginDialogOpen}
           required={!isLoggedIn}
           onOpenChange={(open) => {
@@ -212,8 +212,8 @@ export function InversionDeployer() {
               setLoginDialogOpen(open);
             }
           }}
-          onLogin={async (roleArn, externalId, region) => {
-            await handleRoleLogin(roleArn, externalId, region);
+          onRoleArnReceived={async (roleArn, accountId, externalId, region) => {
+            await handleRoleLogin(roleArn, accountId, externalId, region);
             setLoginDialogOpen(false);
           }}
         />

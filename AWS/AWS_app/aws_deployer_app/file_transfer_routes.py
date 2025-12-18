@@ -20,16 +20,16 @@ from pydantic import BaseModel, Field
 router = APIRouter(prefix="/api", tags=["file-transfer"])
 
 
-def _get_session_credentials_from_api_server(session_id):
-    """Import and call session credentials function from api_server to avoid circular imports."""
-    from api_server import _get_session_credentials
-    return _get_session_credentials(session_id)
+def _get_session_credentials_from_auth(session_id):
+    """Import and call session credentials function from auth_routes."""
+    from auth_routes import get_session_credentials
+    return get_session_credentials(session_id)
 
 
-def _session_from_credentials_from_api_server(credentials, region):
-    """Import and call session creation function from api_server to avoid circular imports."""
-    from api_server import _session_from_credentials
-    return _session_from_credentials(credentials, region)
+def _session_from_credentials_from_auth(credentials, region):
+    """Import and call session creation function from auth_routes."""
+    from auth_routes import session_from_credentials
+    return session_from_credentials(credentials, region)
 
 
 def _session_from_api_server(profile, region):
@@ -107,8 +107,8 @@ def upload(request: Request, body: UploadRequest):
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials_from_api_server(session_id)
-        session = _session_from_credentials_from_api_server(creds, body.region)
+        creds = _get_session_credentials_from_auth(session_id)
+        session = _session_from_credentials_from_auth(creds, body.region)
         account_id = creds.get('account_id', '')
     elif body.profile:
         # Legacy: use profile-based auth
@@ -245,8 +245,8 @@ def download(request: Request, background_tasks: BackgroundTasks, body: Download
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials_from_api_server(session_id)
-        session = _session_from_credentials_from_api_server(creds, body.region)
+        creds = _get_session_credentials_from_auth(session_id)
+        session = _session_from_credentials_from_auth(creds, body.region)
         account_id = creds.get('account_id', '') or body.account_id or ''
     elif body.profile:
         # Legacy: use profile-based auth
@@ -415,8 +415,8 @@ def list_files(request: Request, body: ListFilesRequest):
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials_from_api_server(session_id)
-        session = _session_from_credentials_from_api_server(creds, body.region)
+        creds = _get_session_credentials_from_auth(session_id)
+        session = _session_from_credentials_from_auth(creds, body.region)
         account_id = creds.get('account_id', '') or body.account_id or ''
     elif body.profile:
         # Legacy: use profile-based auth
@@ -590,8 +590,8 @@ def container_logs(request: Request, body: ContainerLogsRequest):
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials_from_api_server(session_id)
-        session = _session_from_credentials_from_api_server(creds, body.region)
+        creds = _get_session_credentials_from_auth(session_id)
+        session = _session_from_credentials_from_auth(creds, body.region)
         account_id = creds.get('account_id', '') or body.account_id or ''
     elif body.profile:
         # Legacy: use profile-based auth
@@ -709,8 +709,8 @@ def download_container_logs(request: Request, background_tasks: BackgroundTasks,
     
     if session_id:
         # Use assumed role credentials
-        creds = _get_session_credentials_from_api_server(session_id)
-        session = _session_from_credentials_from_api_server(creds, body.region)
+        creds = _get_session_credentials_from_auth(session_id)
+        session = _session_from_credentials_from_auth(creds, body.region)
         account_id = creds.get('account_id', '') or body.account_id or ''
     elif body.profile:
         # Legacy: use profile-based auth

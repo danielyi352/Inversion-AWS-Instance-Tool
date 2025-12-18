@@ -94,12 +94,13 @@ export function useAwsConfig() {
 
   const clearLogs = () => setLogs([]);
 
-  const handleRoleLogin = async (roleArn: string, externalId: string, region: string) => {
+  const handleRoleLogin = async (roleArn: string, accountId: string, externalId: string, region: string) => {
     try {
-      addLog('Logging in with IAM Role ARN...', 'info');
+      addLog('Connecting to AWS account...', 'info');
       setProgress(15);
       const response = await assumeRoleLogin({
         roleArn,
+        accountId,
         externalId: externalId || undefined,
         region,
       });
