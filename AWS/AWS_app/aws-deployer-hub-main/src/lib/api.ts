@@ -1,7 +1,9 @@
 import type { AwsConfig, AwsMetadata, DeployResponse, RunningInstance, AssumeRoleLoginRequest, AssumeRoleLoginResponse } from "@/types/aws";
 
-// Use a fixed local API base to avoid proxy/env drift during development.
-const API_BASE = "http://127.0.0.1:8000/api";
+// Use production backend first, fallback to local for development
+const API_BASE = import.meta.env.MODE === 'production'
+  ? "https://inversion-aws-instance-tool.onrender.com/api"
+  : (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api");
 
 // Get session ID from localStorage
 function getSessionId(): string | null {
