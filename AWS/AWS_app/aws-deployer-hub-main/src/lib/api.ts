@@ -1,9 +1,12 @@
 import type { AwsConfig, AwsMetadata, DeployResponse, RunningInstance, AssumeRoleLoginRequest, AssumeRoleLoginResponse } from "@/types/aws";
 
 // Use production backend first, fallback to local for development
-const API_BASE = import.meta.env.MODE === 'production'
-  ? "https://inversion-aws-instance-tool.onrender.com/api"
-  : (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api");
+
+// const API_BASE = import.meta.env.MODE === 'production'
+//   ? "https://inversion-aws-instance-tool.onrender.com/api"
+//   : (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api");
+
+const API_BASE = "http://127.0.0.1:8000/api";
 
 // Get session ID from localStorage
 function getSessionId(): string | null {
@@ -149,25 +152,27 @@ export function checkDockerAvailability() {
   }>("/docker/check");
 }
 
-export function pushImageToEcr(
+export function buildImageWithCodeBuild(
   repository: string,
-  tarFile: File,
+  sourceCode: File,
   imageTag: string = "latest",
-  region: string = "us-east-1"
+  region: string = "us-east-1",
+  dockerfilePath: string = "Dockerfile"
 ) {
   const sessionId = getSessionId();
   const formData = new FormData();
   formData.append('repository', repository);
   formData.append('image_tag', imageTag);
   formData.append('region', region);
-  formData.append('tar_file', tarFile);
+  formData.append('dockerfile_path', dockerfilePath);
+  formData.append('source_code', sourceCode);
 
   const headers: HeadersInit = {};
   if (sessionId) {
     headers['X-Session-ID'] = sessionId;
   }
 
-  return fetch(`${API_BASE}/ecr/push-image`, {
+  return fetch(`${API_BASE}/ecr/build-image`, {
     method: 'POST',
     headers,
     body: formData,
@@ -178,6 +183,32 @@ export function pushImageToEcr(
     }
     return res.json();
   });
+}
+
+export function getBuildStatus(
+  buildId: string,
+  region: string = "us-east-1"
+) {
+  return apiFetch<{
+    status: string;
+    build_id: string;
+    build_status: string;
+    build_phase: string;
+    build_complete: boolean;
+    start_time: string | null;
+    end_time: string | null;
+    logs: {
+      group_name?: string;
+      stream_name?: string;
+      deep_link?: string;
+    };
+    image_uri: string | null;
+    error_info?: {
+      failed_phase?: string;
+      phase_context?: any[];
+    };
+    build_number?: number;
+  }>(`/ecr/build-status/${encodeURIComponent(buildId)}?region=${encodeURIComponent(region)}`);
 }
 
 export function clearRepository(
@@ -504,5 +535,54 @@ export async function downloadContainerLogs(
   document.body.removeChild(a);
 
   return { status: "ok", message: `Downloaded logs as ${filename}` };
+}
+
+export interface ExecuteCommandResponse {
+  status: string;
+  command: string;
+  container_name?: string;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  combined: string;
+}
+
+export async function executeCommand(
+  region: string,
+  instanceId: string,
+  command: string,
+  containerName?: string,
+  repository?: string,
+  accountId?: string,
+  executeOnHost?: boolean,
+): Promise<ExecuteCommandResponse> {
+  const sessionId = getSessionId();
+  const headers: HeadersInit = { "Content-Type": "application/json" };
+  
+  if (sessionId) {
+    headers["X-Session-ID"] = sessionId;
+  }
+
+  const response = await fetch(`${API_BASE}/execute-command`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      profile: "",
+      region,
+      instance_id: instanceId,
+      command: command,
+      container_name: containerName,
+      repository: repository,
+      account_id: accountId,
+      execute_on_host: executeOnHost || false,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Unknown error" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+
+  return response.json();
 }
 

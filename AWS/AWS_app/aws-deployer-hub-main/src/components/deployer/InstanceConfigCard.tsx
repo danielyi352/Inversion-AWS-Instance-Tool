@@ -10,7 +10,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Server, Rocket } from 'lucide-react';
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible';
+import { Server, Rocket, ChevronDown, Settings } from 'lucide-react';
+import { useState } from 'react';
 import type { AwsConfig } from '@/types/aws';
 import { INSTANCE_TYPES } from '@/types/aws';
 
@@ -46,6 +52,8 @@ export function InstanceConfigCard({
   repositoryHasImages = false,
   onDeploy,
 }: InstanceConfigCardProps) {
+  const [isAdvancedOpen, setIsAdvancedOpen] = useState(false);
+
   return (
     <Card className="border-border/60 shadow-sm">
       <CardHeader className="pb-4">
@@ -66,148 +74,123 @@ export function InstanceConfigCard({
           )}
         </div>
       </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="grid gap-4">
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="instanceType" className="text-right text-sm text-muted-foreground">
-              Instance Type
-            </Label>
-            <Select
-              value={config.instanceType}
-              onValueChange={(value) => onConfigChange({ instanceType: value })}
+      <CardContent>
+        <Collapsible open={isAdvancedOpen} onOpenChange={setIsAdvancedOpen}>
+          <CollapsibleTrigger asChild>
+            <Button
+              variant="ghost"
+              className="w-full justify-between mb-4"
             >
-              <SelectTrigger className="bg-muted/50 border-border/60">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {INSTANCE_TYPES.map((type) => (
-                  <SelectItem key={type.value} value={type.value}>
-                    {type.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="amiType" className="text-right text-sm text-muted-foreground">
-              OS Image (AMI)
-            </Label>
-            <div className="space-y-2">
-              <Select
-                value={config.amiType || 'auto'}
-                onValueChange={(value) => {
-                  if (value === 'custom') {
-                    onConfigChange({ amiType: 'custom', amiId: '' });
-                  } else {
-                    onConfigChange({ amiType: value, amiId: undefined });
-                  }
-                }}
-              >
-                <SelectTrigger className="bg-muted/50 border-border/60">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {AMI_TYPES.map((type) => (
-                    <SelectItem key={type.value} value={type.value}>
-                      {type.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {config.amiType === 'custom' && (
-                <Input
-                  id="amiId"
-                  placeholder="ami-xxxxxxxxxxxxxxxxx"
-                  value={config.amiId || ''}
-                  onChange={(e) => onConfigChange({ amiId: e.target.value || undefined })}
-                  className="bg-muted/50 border-border/60 font-mono text-xs"
-                />
-              )}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="volumeSize" className="text-right text-sm text-muted-foreground">
-              Volume Size (GiB)
-            </Label>
-            <Input
-              id="volumeSize"
-              type="number"
-              min={1}
-              max={2048}
-              value={config.volumeSize}
-              onChange={(e) => onConfigChange({ volumeSize: parseInt(e.target.value) || 30 })}
-              className="bg-muted/50 border-border/60 w-32"
-            />
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="volumeType" className="text-right text-sm text-muted-foreground">
-              Volume Type
-            </Label>
-            <Select
-              value={config.volumeType || 'gp3'}
-              onValueChange={(value) => onConfigChange({ volumeType: value })}
-            >
-              <SelectTrigger className="bg-muted/50 border-border/60">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {VOLUME_TYPES.map((type) => (
-                  <SelectItem key={type.value} value={type.value}>
-                    {type.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="availabilityZone" className="text-right text-sm text-muted-foreground">
-              Availability Zone
-            </Label>
-            <Input
-              id="availabilityZone"
-              placeholder="Leave empty for default"
-              value={config.availabilityZone || ''}
-              onChange={(e) => onConfigChange({ availabilityZone: e.target.value || undefined })}
-              className="bg-muted/50 border-border/60"
-            />
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-center gap-3">
-            <Label htmlFor="subnetId" className="text-right text-sm text-muted-foreground">
-              Subnet ID
-            </Label>
-            <Input
-              id="subnetId"
-              placeholder="Leave empty for default VPC"
-              value={config.subnetId || ''}
-              onChange={(e) => onConfigChange({ subnetId: e.target.value || undefined })}
-              className="bg-muted/50 border-border/60 font-mono text-xs"
-            />
-          </div>
-
-          <div className="grid grid-cols-[140px_1fr] items-start gap-3">
-            <Label htmlFor="userData" className="text-right text-sm text-muted-foreground pt-2">
-              User Data
-            </Label>
-            <div className="space-y-1">
-              <Textarea
-                id="userData"
-                placeholder="#!/bin/bash&#10;# Optional initialization script&#10;# This runs when the instance first starts"
-                value={config.userData || ''}
-                onChange={(e) => onConfigChange({ userData: e.target.value || undefined })}
-                className="bg-muted/50 border-border/60 font-mono text-xs min-h-[100px]"
-                rows={4}
+              <span className="flex items-center gap-2">
+                <Settings className="h-4 w-4" />
+                Advanced Settings
+              </span>
+              <ChevronDown
+                className={`h-4 w-4 transition-transform duration-200 ${
+                  isAdvancedOpen ? 'transform rotate-180' : ''
+                }`}
               />
-              <p className="text-xs text-muted-foreground">
-                Optional bash script to run on instance startup
-              </p>
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="grid gap-4 pt-2">
+              <div className="grid grid-cols-[140px_1fr] items-center gap-3">
+                <Label htmlFor="instanceType" className="text-right text-sm text-muted-foreground">
+                  Instance Type
+                </Label>
+                <Select
+                  value={config.instanceType}
+                  onValueChange={(value) => onConfigChange({ instanceType: value })}
+                >
+                  <SelectTrigger className="bg-muted/50 border-border/60">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {INSTANCE_TYPES.map((type) => (
+                      <SelectItem key={type.value} value={type.value}>
+                        {type.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="grid grid-cols-[140px_1fr] items-center gap-3">
+                <Label htmlFor="amiType" className="text-right text-sm text-muted-foreground">
+                  OS Image (AMI)
+                </Label>
+                <div className="space-y-2">
+                  <Select
+                    value={config.amiType || 'auto'}
+                    onValueChange={(value) => {
+                      if (value === 'custom') {
+                        onConfigChange({ amiType: 'custom', amiId: '' });
+                      } else {
+                        onConfigChange({ amiType: value, amiId: undefined });
+                      }
+                    }}
+                  >
+                    <SelectTrigger className="bg-muted/50 border-border/60">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {AMI_TYPES.map((type) => (
+                        <SelectItem key={type.value} value={type.value}>
+                          {type.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {config.amiType === 'custom' && (
+                    <Input
+                      id="amiId"
+                      placeholder="ami-xxxxxxxxxxxxxxxxx"
+                      value={config.amiId || ''}
+                      onChange={(e) => onConfigChange({ amiId: e.target.value || undefined })}
+                      className="bg-muted/50 border-border/60 font-mono text-xs"
+                    />
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-[140px_1fr] items-center gap-3">
+                <Label htmlFor="volumeSize" className="text-right text-sm text-muted-foreground">
+                  Volume Size (GiB)
+                </Label>
+                <Input
+                  id="volumeSize"
+                  type="number"
+                  min={1}
+                  max={2048}
+                  value={config.volumeSize}
+                  onChange={(e) => onConfigChange({ volumeSize: parseInt(e.target.value) || 30 })}
+                  className="bg-muted/50 border-border/60 w-32"
+                />
+              </div>
+
+              <div className="grid grid-cols-[140px_1fr] items-center gap-3">
+                <Label htmlFor="volumeType" className="text-right text-sm text-muted-foreground">
+                  Volume Type
+                </Label>
+                <Select
+                  value={config.volumeType || 'gp3'}
+                  onValueChange={(value) => onConfigChange({ volumeType: value })}
+                >
+                  <SelectTrigger className="bg-muted/50 border-border/60">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {VOLUME_TYPES.map((type) => (
+                      <SelectItem key={type.value} value={type.value}>
+                        {type.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
-          </div>
-        </div>
+          </CollapsibleContent>
+        </Collapsible>
       </CardContent>
     </Card>
   );

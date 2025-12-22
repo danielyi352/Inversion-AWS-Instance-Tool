@@ -473,13 +473,12 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
     run_params = {
         'ImageId': ami_id,
         'InstanceType': instance_type,
-        'SecurityGroups': [security_group_name],
         'IamInstanceProfile': {'Arn': instance_profile_arn},
         'BlockDeviceMappings': [{
             'DeviceName': root_device_name,
             'Ebs': {
                 'VolumeSize': volume_size,
-                'VolumeType': 'gp3'
+                'VolumeType': volume_type or 'gp3'
             }
         }],
         'TagSpecifications': [{
@@ -493,14 +492,41 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
         'MaxCount': 1
     }
     
-    # Add optional parameters
-    if availability_zone:
-        run_params['Placement'] = {'AvailabilityZone': availability_zone}
-    
+    # Handle security groups and networking
     if subnet_id:
+        # When SubnetId is specified, must use SecurityGroupIds (not SecurityGroups names)
+        # Get security group ID from name
+        try:
+            sg_response = ec2_client.describe_security_groups(
+                GroupNames=[security_group_name]
+            )
+            if not sg_response['SecurityGroups']:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Security group '{security_group_name}' not found"
+                )
+            security_group_id = sg_response['SecurityGroups'][0]['GroupId']
+            run_params['SecurityGroupIds'] = [security_group_id]
+        except ClientError as e:
+            # If describe_security_groups fails, try by ID
+            try:
+                sg_response = ec2_client.describe_security_groups(
+                    GroupIds=[security_group_name]
+                )
+                security_group_id = sg_response['SecurityGroups'][0]['GroupId']
+                run_params['SecurityGroupIds'] = [security_group_id]
+            except ClientError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to get security group: {e}"
+                )
         run_params['SubnetId'] = subnet_id
-        # Note: When SubnetId is specified, SecurityGroups should be IDs, not names
-        # But we'll keep the name for now - AWS will handle it
+        # Don't specify Placement when using SubnetId - subnet determines AZ
+    else:
+        # No subnet specified, use SecurityGroups (names) and optional Placement
+        run_params['SecurityGroups'] = [security_group_name]
+        if availability_zone:
+            run_params['Placement'] = {'AvailabilityZone': availability_zone}
     
     if user_data:
         # User data should be base64 encoded

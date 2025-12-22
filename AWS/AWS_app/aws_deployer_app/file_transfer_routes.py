@@ -79,6 +79,17 @@ class ContainerLogsRequest(BaseModel):
     follow: bool = Field(default=False, description="Follow log output (for streaming, not implemented yet)")
 
 
+class ExecuteCommandRequest(BaseModel):
+    profile: str
+    region: str
+    instance_id: str
+    command: str = Field(..., description="Command to execute")
+    container_name: Optional[str] = Field(None, description="Container name if executing command in container. If not provided, executes on host.")
+    repository: Optional[str] = Field(None, description="Repository name for auto-detecting container name")
+    account_id: Optional[str] = Field(None, description="Account ID for auto-detecting container name")
+    execute_on_host: bool = Field(default=False, description="Force execution on host instead of container, even if container exists")
+
+
 def _get_container_name_from_instance(ec2_client, instance_id: str, account_id: str, repository: Optional[str] = None) -> Optional[str]:
     """Auto-detect container name from instance tags or repository."""
     try:
@@ -805,4 +816,85 @@ def download_container_logs(request: Request, background_tasks: BackgroundTasks,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Download container logs failed: {str(e)}")
+
+
+@router.post("/execute-command")
+def execute_command(request: Request, body: ExecuteCommandRequest):
+    """
+    Execute a command on an EC2 instance or inside a container via SSM.
+    Can execute commands on the host or inside a Docker container.
+    """
+    # Check for session-based auth
+    session_id = request.headers.get("X-Session-ID")
+    
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
+    
+    try:
+        creds = _get_session_credentials_from_auth(session_id)
+        region = body.region or creds.get('region', 'us-east-1')
+        session = _session_from_credentials_from_auth(creds, region)
+        account_id = creds.get('account_id', '')
+    except HTTPException as e:
+        raise
+    
+    ssm_client = session.client("ssm", region_name=region)
+    
+    # Auto-detect container name if not provided (unless forcing host execution)
+    container_name = body.container_name
+    if not container_name and not body.execute_on_host:
+        ec2_client = session.client("ec2", region_name=region)
+        container_name = _get_container_name_from_instance(
+            ec2_client, body.instance_id, account_id, body.repository
+        )
+    
+    try:
+        # Build command - execute on host if explicitly requested or no container
+        if body.execute_on_host or not container_name:
+            # Execute command on host
+            command = body.command
+        else:
+            # Execute command inside Docker container
+            command = f"docker exec {shlex.quote(container_name)} sh -c {shlex.quote(body.command)}"
+        
+        response = ssm_client.send_command(
+            InstanceIds=[body.instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={'commands': [command]}
+        )
+        command_id = response['Command']['CommandId']
+        
+        # Wait for command to complete (up to 60 seconds)
+        for _ in range(30):
+            time.sleep(2)
+            result = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=body.instance_id
+            )
+            status = result['Status']
+            if status in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
+                break
+        
+        output = result.get('StandardOutputContent', '')
+        error_output = result.get('StandardErrorContent', '')
+        
+        return {
+            "status": "ok",
+            "command": body.command,
+            "container_name": container_name,
+            "exit_code": 0 if result['Status'] == 'Success' else 1,
+            "stdout": output,
+            "stderr": error_output,
+            "combined": output + (f"\n{error_output}" if error_output else "")
+        }
+        
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"AWS error ({error_code}): {error_msg}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Execute command failed: {str(e)}")
 

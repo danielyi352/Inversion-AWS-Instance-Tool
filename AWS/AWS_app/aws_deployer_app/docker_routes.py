@@ -1,16 +1,25 @@
 """
-Docker and ECR-related API routes for pushing Docker images to ECR.
-Supports tar file uploads from user's local machine.
+Docker and ECR-related API routes.
+Uses AWS CodeBuild to build and push Docker images to ECR.
+No Docker required on backend - CodeBuild handles everything.
 """
 
 import os
-import subprocess
+import json
+import time
+import uuid
+import zipfile
 import tempfile
-import base64
+import logging
+import yaml
+from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["docker"])
 
@@ -27,83 +36,34 @@ def _session_from_credentials_from_auth(credentials, region):
     return session_from_credentials(credentials, region)
 
 
-def check_docker_availability():
-    """Check if Docker is installed and available."""
-    try:
-        result = subprocess.run(
-            ["docker", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            docker_version = result.stdout.strip()
-            # Also check if Docker daemon is running
-            try:
-                daemon_result = subprocess.run(
-                    ["docker", "info"],
-                    capture_output=True,
-                    timeout=5
-                )
-                return {
-                    "available": True,
-                    "version": docker_version,
-                    "daemon_running": daemon_result.returncode == 0,
-                    "message": "Docker is available and daemon is running" if daemon_result.returncode == 0 else "Docker is installed but daemon is not running"
-                }
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                return {
-                    "available": True,
-                    "version": docker_version,
-                    "daemon_running": False,
-                    "message": "Docker is installed but daemon is not running"
-                }
-        else:
-            return {
-                "available": False,
-                "version": None,
-                "daemon_running": False,
-                "message": "Docker command failed"
-            }
-    except FileNotFoundError:
-        return {
-            "available": False,
-            "version": None,
-            "daemon_running": False,
-            "message": "Docker is not installed"
-        }
-    except Exception as e:
-        return {
-            "available": False,
-            "version": None,
-            "daemon_running": False,
-            "message": f"Error checking Docker: {str(e)}"
-        }
-
-
 @router.get("/docker/check")
 def docker_check():
-    """Check if Docker is installed and available."""
-    return check_docker_availability()
+    """
+    Informational endpoint - Docker should be installed on the user's local machine.
+    This endpoint always returns available=True since Docker operations are done client-side.
+    """
+    return {
+        "available": True,
+        "version": None,
+        "daemon_running": True,
+        "message": "Docker should be installed on your local machine. Push images using the provided commands."
+    }
 
 
-@router.post("/ecr/push-image")
-async def push_image_to_ecr(
+@router.post("/ecr/build-image")
+async def build_image_with_codebuild(
     request: Request,
     repository: str = Form(...),
     image_tag: str = Form(default="latest"),
     region: str = Form(default="us-east-1"),
-    tar_file: UploadFile = File(..., description="Docker image tar file (from 'docker save', e.g., 'docker save myimage:latest -o myimage.tar')")
+    dockerfile_path: str = Form(default="Dockerfile"),
+    source_code: UploadFile = File(..., description="Source code zip file or Docker image tar file")
 ):
     """
-    Push Docker image to ECR repository from uploaded tar file.
-    
-    The user must:
-    1. Build their Docker image locally: docker build -t myimage:latest .
-    2. Export to tar file: docker save myimage:latest -o myimage.tar
-    3. Upload the tar file through this endpoint
-    
-    The backend will load the image, tag it, and push it to ECR.
+    Build and push Docker image to ECR using AWS CodeBuild.
+    Supports both:
+    - Source code zip file: CodeBuild will build from Dockerfile
+    - Docker image tar file: CodeBuild will load and push the image
     """
     # Check for session-based auth
     session_id = request.headers.get("X-Session-ID")
@@ -113,215 +73,453 @@ async def push_image_to_ecr(
     
     try:
         creds = _get_session_credentials_from_auth(session_id)
-        # Use region from form, fallback to session region
         region = region or creds.get('region', 'us-east-1')
         session = _session_from_credentials_from_auth(creds, region)
         account_id = creds.get('account_id', '')
     except HTTPException as e:
         raise
     
-    # Check if Docker is available
-    docker_check_result = check_docker_availability()
-    if not docker_check_result["available"]:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Docker is not available: {docker_check_result['message']}"
-        )
-    if not docker_check_result["daemon_running"]:
-        raise HTTPException(
-            status_code=503,
-            detail="Docker daemon is not running. Please start Docker and try again."
-        )
-    
     ecr = session.client("ecr", region_name=region)
-    ecr_registry = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
-    full_image_name = f"{ecr_registry}/{repository}:{image_tag}"
+    s3 = session.client("s3", region_name=region)
+    codebuild = session.client("codebuild", region_name=region)
+    iam = session.client("iam", region_name=region)
     
-    temp_tar_path = None
-    loaded_image_name = None
+    ecr_registry = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
+    full_image_uri = f"{ecr_registry}/{repository}:{image_tag}"
+    
+    # Detect file type from filename
+    filename = source_code.filename or "source.zip"
+    is_tar_file = filename.endswith('.tar') or filename.endswith('.tar.gz')
+    file_extension = '.tar' if is_tar_file else '.zip'
+    
+    # Generate unique build ID
+    build_id = str(uuid.uuid4())[:8]
+    s3_bucket = f"inversion-codebuild-{account_id}"
+    s3_key = f"source/{build_id}/source{file_extension}"
+    
+    temp_file_path = None
     
     try:
-        # Step 1: Ensure repository exists
+        # Step 1: Ensure ECR repository exists
         try:
             ecr.describe_repositories(repositoryNames=[repository])
         except ClientError as e:
             if e.response['Error']['Code'] == 'RepositoryNotFoundException':
-                # Create repository if it doesn't exist
-                try:
-                    ecr.create_repository(
-                        repositoryName=repository,
-                        imageScanningConfiguration={'scanOnPush': True},
-                        imageTagMutability='MUTABLE'
-                    )
-                except ClientError as create_err:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to create repository: {create_err}"
-                    )
+                ecr.create_repository(
+                    repositoryName=repository,
+                    imageScanningConfiguration={'scanOnPush': True},
+                    imageTagMutability='MUTABLE'
+                )
             else:
                 raise
         
-        # Step 2: Get ECR login token
+        # Step 2: Ensure S3 bucket exists for source code
         try:
-            response = ecr.get_authorization_token()
-            token = response['authorizationData'][0]['authorizationToken']
-            username, password = base64.b64decode(token).decode('utf-8').split(':')
+            s3.head_bucket(Bucket=s3_bucket)
         except ClientError as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to get ECR authorization token: {e}"
-            )
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code in ['404', '403']:
+                try:
+                    s3.create_bucket(
+                        Bucket=s3_bucket,
+                        CreateBucketConfiguration={'LocationConstraint': region} if region != 'us-east-1' else {}
+                    )
+                except ClientError as create_err:
+                    if create_err.response.get('Error', {}).get('Code') != 'BucketAlreadyOwnedByYou':
+                        raise
         
-        # Step 3: Login to ECR
-        try:
-            login_cmd = [
-                "docker", "login",
-                "--username", username,
-                "--password-stdin",
-                ecr_registry
-            ]
-            login_process = subprocess.Popen(
-                login_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            stdout, stderr = login_process.communicate(input=password, timeout=30)
-            if login_process.returncode != 0:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to login to ECR: {stderr}"
-                )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(
-                status_code=500,
-                detail="Docker login timed out"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to login to ECR: {str(e)}"
-            )
-        
-        # Step 4: Load image from uploaded tar file
-        # Save uploaded file to temporary location
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.tar') as temp_file:
-            temp_tar_path = temp_file.name
-            # Read and write the uploaded file
-            content = await tar_file.read()
+        # Step 3: Save uploaded file, create buildspec.yml, package into zip, and upload to S3
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+            temp_file_path = temp_file.name
+            content = await source_code.read()
             temp_file.write(content)
         
-        # Load the image from tar file
-        load_cmd = ["docker", "load", "-i", temp_tar_path]
-        load_result = subprocess.run(
-            load_cmd,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minutes for large images
+        # Create buildspec.yml content using yaml.dump for proper escaping
+        if is_tar_file:
+            # For tar files: load and push
+            buildspec_dict = {
+                'version': '0.2',
+                'phases': {
+                    'pre_build': {
+                        'commands': [
+                            'echo Logging in to Amazon ECR...',
+                            f'aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com',
+                            f'export REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/{repository}',
+                            f'export IMAGE_TAG={image_tag}',
+                            'echo Listing files in working directory...',
+                            'ls -la',
+                            'echo Finding tar file...',
+                            "TAR_FILE=$(find . -maxdepth 2 '(' -name '*.tar' -o -name '*.tar.gz' ')' | head -n 1)",
+                            'echo Found tar file: $TAR_FILE',
+                            'test -n "$TAR_FILE"',
+                            'echo Loading Docker image from tar file...',
+                            'docker load -i "$TAR_FILE"'
+                        ]
+                    },
+                    'build': {
+                        'commands': [
+                            'echo Extracting image name from loaded image...',
+                            "LOADED_IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' | head -n 1)",
+                            'echo Loaded image: $LOADED_IMAGE',
+                            'echo Tagging image for ECR...',
+                            'docker tag "$LOADED_IMAGE" "$REPOSITORY_URI:$IMAGE_TAG"'
+                        ]
+                    },
+                    'post_build': {
+                        'commands': [
+                            'echo Pushing the Docker image to ECR...',
+                            'docker push "$REPOSITORY_URI:$IMAGE_TAG"',
+                            'echo Image pushed successfully: $REPOSITORY_URI:$IMAGE_TAG'
+                        ]
+                    }
+                }
+            }
+        else:
+            # For source code: build from Dockerfile
+            buildspec_dict = {
+                'version': '0.2',
+                'phases': {
+                    'pre_build': {
+                        'commands': [
+                            'echo Logging in to Amazon ECR...',
+                            f'aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com',
+                            f'export REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/{repository}',
+                            f'export IMAGE_TAG={image_tag}',
+                            'echo Listing files in working directory...',
+                            'ls -la',
+                            'echo Finding zip file...',
+                            "ZIP_FILE=$(find . -name '*.zip' | head -n 1)",
+                            'echo Found zip file: $ZIP_FILE',
+                            'echo Extracting source code...',
+                            'unzip -q "$ZIP_FILE"'
+                        ]
+                    },
+                    'build': {
+                        'commands': [
+                            'echo Build started on $(date)',
+                            'echo Building the Docker image...',
+                            f'docker build -f {dockerfile_path} -t "$REPOSITORY_URI:$IMAGE_TAG" .'
+                        ]
+                    },
+                    'post_build': {
+                        'commands': [
+                            'echo Build completed on $(date)',
+                            'echo Pushing the Docker image...',
+                            'docker push "$REPOSITORY_URI:$IMAGE_TAG"',
+                            'echo Image pushed: $REPOSITORY_URI:$IMAGE_TAG'
+                        ]
+                    }
+                }
+            }
+        
+        # Generate YAML content with proper formatting
+        buildspec_content = yaml.dump(buildspec_dict, default_flow_style=False, sort_keys=False)
+        
+        # Create a zip file containing both the user's file and buildspec.yml
+        zip_s3_key = f"source/{build_id}/source.zip"
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as zip_file:
+            zip_path = zip_file.name
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add the user's file (tar or zip) to the zip
+                zipf.write(temp_file_path, os.path.basename(temp_file_path))
+                # Add buildspec.yml to the zip
+                zipf.writestr('buildspec.yml', buildspec_content)
+        
+        # Upload the zip to S3
+        s3.upload_file(zip_path, s3_bucket, zip_s3_key)
+        
+        # Update s3_key to point to the zip file
+        s3_key = zip_s3_key
+        
+        # Clean up zip file
+        try:
+            os.unlink(zip_path)
+        except Exception:
+            pass
+        
+        # Step 4: Ensure CodeBuild service role exists
+        role_name = f"InversionCodeBuildRole-{account_id}"
+        role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+        
+        try:
+            iam.get_role(RoleName=role_name)
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchEntity':
+                # Create service role for CodeBuild
+                trust_policy = {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "codebuild.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                }
+                
+                # Policy for ECR, S3, and CloudWatch Logs access
+                policy_doc = {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:GetObject",
+                                "s3:GetObjectVersion",
+                                "s3:PutObject"
+                            ],
+                            "Resource": f"arn:aws:s3:::{s3_bucket}/*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:ListBucket",
+                                "s3:GetBucketLocation"
+                            ],
+                            "Resource": f"arn:aws:s3:::{s3_bucket}"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "ecr:GetAuthorizationToken"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "ecr:BatchCheckLayerAvailability",
+                                "ecr:GetDownloadUrlForLayer",
+                                "ecr:BatchGetImage",
+                                "ecr:PutImage",
+                                "ecr:InitiateLayerUpload",
+                                "ecr:UploadLayerPart",
+                                "ecr:CompleteLayerUpload"
+                            ],
+                            "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "logs:CreateLogGroup",
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents"
+                            ],
+                            "Resource": f"arn:aws:logs:{region}:{account_id}:log-group:/aws/codebuild/*"
+                        }
+                    ]
+                }
+
+                
+                iam.create_role(
+                    RoleName=role_name,
+                    AssumeRolePolicyDocument=json.dumps(trust_policy),
+                    Description="Service role for Inversion CodeBuild projects"
+                )
+                
+                # Wait a moment for role to be available
+                time.sleep(2)
+                
+                iam.put_role_policy(
+                    RoleName=role_name,
+                    PolicyName="CodeBuildPolicy",
+                    PolicyDocument=json.dumps(policy_doc)
+                )
+                
+                # Wait for policy to propagate
+                time.sleep(1)
+        
+        # Step 5: Create or get CodeBuild project
+        project_name = f"inversion-build-{repository.replace('_', '-')}"
+        
+        # S3 location for CodeBuild (without s3:// prefix)
+        s3_location = f"{s3_bucket}/{s3_key}"
+        
+        try:
+            codebuild.create_project(
+                name=project_name,
+                description=f"Build Docker image for {repository}",
+                source={
+                    'type': 'S3',
+                    'location': s3_location,
+                },
+                artifacts={
+                    'type': 'NO_ARTIFACTS'
+                },
+                environment={
+                    'type': 'LINUX_CONTAINER',
+                    'image': 'aws/codebuild/standard:7.0',
+                    'computeType': 'BUILD_GENERAL1_SMALL',
+                    'privilegedMode': True,
+                    'environmentVariables': [
+                        {'name': 'AWS_DEFAULT_REGION', 'value': region},
+                        {'name': 'AWS_ACCOUNT_ID', 'value': account_id},
+                        {'name': 'IMAGE_REPO_NAME', 'value': repository},
+                        {'name': 'IMAGE_TAG', 'value': image_tag},
+                        {'name': 'IMAGE_URI', 'value': full_image_uri},
+                    ]
+                },
+                serviceRole=role_arn,
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
+                raise
+            # Project exists, update it
+            codebuild.update_project(
+                name=project_name,
+                description=f"Build Docker image for {repository}",
+                source={
+                    'type': 'S3',
+                    'location': s3_location,
+                },
+                artifacts={
+                    'type': 'NO_ARTIFACTS'
+                },
+                environment={
+                    'type': 'LINUX_CONTAINER',
+                    'image': 'aws/codebuild/standard:7.0',
+                    'computeType': 'BUILD_GENERAL1_SMALL',
+                    'privilegedMode': True,
+                    'environmentVariables': [
+                        {'name': 'AWS_DEFAULT_REGION', 'value': region},
+                        {'name': 'AWS_ACCOUNT_ID', 'value': account_id},
+                        {'name': 'IMAGE_REPO_NAME', 'value': repository},
+                        {'name': 'IMAGE_TAG', 'value': image_tag},
+                        {'name': 'IMAGE_URI', 'value': full_image_uri},
+                    ]
+                },
+                serviceRole=role_arn,
+            )
+        
+        # Step 6: Start the build
+        build_response = codebuild.start_build(
+            projectName=project_name,
+            sourceLocationOverride=s3_location,
         )
         
-        if load_result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to load image from tar file: {load_result.stderr}"
-            )
-        
-        # Extract image name from docker load output
-        # Output format: "Loaded image: myimage:latest" or "Loaded image: myimage:latest\nLoaded image: myimage:tag2"
-        loaded_image_name = None
-        output_lines_load = load_result.stdout.strip().split('\n')
-        if output_lines_load:
-            # Get the last loaded image (usually the main one)
-            last_line = output_lines_load[-1]
-            if 'Loaded image:' in last_line:
-                loaded_image_name = last_line.split('Loaded image:')[1].strip()
-            else:
-                # Fallback: try to extract from first line
-                if 'Loaded image:' in output_lines_load[0]:
-                    loaded_image_name = output_lines_load[0].split('Loaded image:')[1].strip()
-        
-        if not loaded_image_name:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to extract image name from docker load output. Please ensure the tar file contains a valid Docker image."
-            )
-        
-        # Use the loaded image name for tagging
-        source_image_name = loaded_image_name
-        
-        # Step 5: Tag the image
-        tag_cmd = ["docker", "tag", source_image_name, full_image_name]
-        tag_result = subprocess.run(
-            tag_cmd,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        if tag_result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to tag image '{source_image_name}'. Make sure the image exists. Error: {tag_result.stderr}"
-            )
-        
-        # Step 6: Push image to ECR
-        push_cmd = ["docker", "push", full_image_name]
-        push_process = subprocess.Popen(
-            push_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        
-        # Stream output
-        output_lines = []
-        for line in push_process.stdout:
-            output_lines.append(line.strip())
-        
-        push_process.wait(timeout=600)  # 10 minute timeout
-        
-        if push_process.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to push image to ECR. Output: {''.join(output_lines[-10:])}"
-            )
+        build_id_arn = build_response['build']['id']
         
         return {
             "status": "ok",
-            "message": f"Successfully pushed {full_image_name} to ECR",
-            "imageUri": full_image_name,
-            "sourceImage": source_image_name,
-            "output": "\n".join(output_lines)
+            "message": "Build started successfully",
+            "build_id": build_id_arn,
+            "project_name": project_name,
+            "image_uri": full_image_uri,
+            "repository": repository,
+            "tag": image_tag,
+            "region": region
         }
         
     except HTTPException:
         raise
-    except subprocess.TimeoutExpired:
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        # Log full error for debugging
+        logger.error(f"CodeBuild ClientError: {error_code} - {error_msg}")
+        logger.error(f"Full error response: {json.dumps(e.response, default=str)}")
+        
+        # Provide more helpful error messages
+        if error_code == 'AccessDeniedException':
+            detail_msg = f"Access denied: {error_msg}. Please ensure the IAM role has CodeBuild permissions."
+        elif error_code == 'InvalidInputException':
+            detail_msg = f"Invalid input: {error_msg}. Check your parameters."
+        else:
+            detail_msg = f"AWS error ({error_code}): {error_msg}"
+        
         raise HTTPException(
             status_code=500,
-            detail="Docker operation timed out"
+            detail=detail_msg
         )
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"Unexpected error starting build: {str(e)}")
+        logger.error(f"Traceback: {error_trace}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start build: {str(e)}"
+        )
+    finally:
+        # Clean up temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except Exception:
+                pass
+
+
+@router.get("/ecr/build-status/{build_id}")
+def get_build_status(
+    request: Request,
+    build_id: str,
+    region: str = "us-east-1"
+):
+    """Get the status of a CodeBuild build."""
+    session_id = request.headers.get("X-Session-ID")
+    
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
+    
+    try:
+        creds = _get_session_credentials_from_auth(session_id)
+        region = region or creds.get('region', 'us-east-1')
+        session = _session_from_credentials_from_auth(creds, region)
+    except HTTPException as e:
+        raise
+    
+    codebuild = session.client("codebuild", region_name=region)
+    
+    try:
+        builds = codebuild.batch_get_builds(ids=[build_id])
+        if not builds['builds']:
+            raise HTTPException(status_code=404, detail="Build not found")
+        
+        build = builds['builds'][0]
+        
+        # Extract error information if build failed
+        error_info = None
+        if build.get('buildStatus') == 'FAILED':
+            # Get phase information for errors
+            phases = build.get('phases', [])
+            failed_phases = [p for p in phases if p.get('phaseStatus') == 'FAILED']
+            if failed_phases:
+                error_info = {
+                    "failed_phase": failed_phases[0].get('phaseType', 'UNKNOWN'),
+                    "phase_context": failed_phases[0].get('phaseContext', []),
+                }
+        
+        # Extract image_uri from environment variables (which is a list, not a dict)
+        env_vars = build.get("environment", {}).get("environmentVariables", []) or []
+        env_map = {v.get("name"): v.get("value") for v in env_vars if isinstance(v, dict)}
+        image_uri = env_map.get("IMAGE_URI") or env_map.get("REPOSITORY_URI")
+        
+        return {
+            "status": "ok",
+            "build_id": build['id'],
+            "build_status": build['buildStatus'],
+            "build_phase": build.get('currentPhase', 'UNKNOWN'),
+            "build_complete": build['buildComplete'],
+            "start_time": build.get('startTime', {}).isoformat() if build.get('startTime') else None,
+            "end_time": build.get('endTime', {}).isoformat() if build.get('endTime') else None,
+            "logs": {
+                "group_name": build.get('logs', {}).get('groupName'),
+                "stream_name": build.get('logs', {}).get('streamName'),
+                "deep_link": build.get('logs', {}).get('deepLink'),
+            },
+            "image_uri": image_uri,
+            "error_info": error_info,
+            "build_number": build.get('buildNumber'),
+        }
     except ClientError as e:
         error_code = e.response.get('Error', {}).get('Code', 'Unknown')
         error_msg = e.response.get('Error', {}).get('Message', str(e))
         raise HTTPException(
             status_code=500,
-            detail=f"AWS ECR error ({error_code}): {error_msg}"
+            detail=f"AWS CodeBuild error ({error_code}): {error_msg}"
         )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to push image to ECR: {str(e)}"
-        )
-    finally:
-        # Clean up temporary tar file
-        if temp_tar_path and os.path.exists(temp_tar_path):
-            try:
-                os.unlink(temp_tar_path)
-            except Exception:
-                pass  # Don't fail if cleanup fails
 
 
 @router.delete("/ecr/repositories/{repository}")

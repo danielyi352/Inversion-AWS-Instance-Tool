@@ -18,7 +18,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: InversionDeployerRole
-      Description: "IAM role for Inversion Deployer - allows backend service to manage EC2, ECR, SSM, and S3 resources"
+      Description: "IAM role for Inversion Deployer - allows backend service to manage EC2, ECR, SSM, S3, CodeBuild, and IAM resources"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -38,6 +38,7 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonSSMFullAccess
         - arn:aws:iam::aws:policy/AmazonS3FullAccess
         - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
       Policies:
         - PolicyName: InversionDeployerInstanceRolePolicy
           PolicyDocument:
@@ -51,9 +52,43 @@ Resources:
                   - iam:PassRole
                   - iam:GetRole
                   - iam:GetInstanceProfile
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
                 Resource:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/inversion-deployer-instance-role-*"
                   - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/inversion-deployer-instance-role-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/InversionCodeBuildRole-*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/InversionCodeBuildRole-*"
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": "codebuild.amazonaws.com"
+        - PolicyName: InversionDeployerCodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateProject
+                  - codebuild:UpdateProject
+                  - codebuild:DeleteProject
+                  - codebuild:BatchGetProjects
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:ListBuilds
+                  - codebuild:ListBuildsForProject
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
 
 Conditions:
   HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
