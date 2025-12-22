@@ -207,8 +207,24 @@ export function getBuildStatus(
       failed_phase?: string;
       phase_context?: any[];
     };
+    error_message?: string;
     build_number?: number;
   }>(`/ecr/build-status/${encodeURIComponent(buildId)}?region=${encodeURIComponent(region)}`);
+}
+
+export function getBuildLogs(
+  buildId: string,
+  region: string = "us-east-1",
+  limit: number = 1000
+) {
+  return apiFetch<{
+    status: string;
+    logs: string;
+    log_group?: string;
+    log_stream?: string;
+    event_count?: number;
+    message?: string;
+  }>(`/ecr/build-logs/${encodeURIComponent(buildId)}?region=${encodeURIComponent(region)}&limit=${limit}`);
 }
 
 export function clearRepository(

@@ -6,7 +6,7 @@ import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Upload, Loader2, CheckCircle2, XCircle, AlertCircle, Terminal } from 'lucide-react';
 import { toast } from 'sonner';
-import { buildImageWithCodeBuild, getBuildStatus, clearRepository } from '@/lib/api';
+import { buildImageWithCodeBuild, getBuildStatus, getBuildLogs, clearRepository } from '@/lib/api';
 import type { AwsConfig } from '@/types/aws';
 
 interface DockerImageUploadSectionProps {
@@ -42,7 +42,11 @@ export function DockerImageUploadSection({
       failed_phase?: string;
       phase_context?: any[];
     };
+    error_message?: string;
   } | null>(null);
+  const [buildLogs, setBuildLogs] = useState<string>('');
+  const [showLogs, setShowLogs] = useState(false);
+  const [loadingLogs, setLoadingLogs] = useState(false);
 
   // Poll build status if build is in progress
   useEffect(() => {
@@ -342,15 +346,68 @@ export function DockerImageUploadSection({
                       Failed in phase: {buildStatus.error_info.failed_phase}
                     </div>
                   )}
-                  {buildStatus.logs?.deep_link && (
-                    <a
-                      href={buildStatus.logs.deep_link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs text-blue-600 hover:underline mt-1 block"
-                    >
-                      View Build Logs →
-                    </a>
+                  {buildStatus.error_message && (
+                    <div className="text-xs text-red-600 mt-1 font-mono bg-red-50 dark:bg-red-900/20 p-2 rounded border border-red-200 dark:border-red-800">
+                      {buildStatus.error_message}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2 mt-2">
+                    {buildStatus.logs?.deep_link && (
+                      <a
+                        href={buildStatus.logs.deep_link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-blue-600 hover:underline"
+                      >
+                        View in AWS Console →
+                      </a>
+                    )}
+                    {buildId && buildStatus.build_status === 'FAILED' && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={async () => {
+                          if (showLogs) {
+                            setShowLogs(false);
+                            return;
+                          }
+                          setLoadingLogs(true);
+                          try {
+                            const logs = await getBuildLogs(buildId, config.region);
+                            setBuildLogs(logs.logs || logs.message || 'No logs available');
+                            setShowLogs(true);
+                          } catch (error) {
+                            const errorMessage = error instanceof Error ? error.message : 'Failed to load logs';
+                            toast.error(`Failed to load build logs: ${errorMessage}`);
+                            setBuildLogs(`Error loading logs: ${errorMessage}`);
+                            setShowLogs(true);
+                          } finally {
+                            setLoadingLogs(false);
+                          }
+                        }}
+                        disabled={loadingLogs}
+                        className="text-xs h-7"
+                      >
+                        {loadingLogs ? (
+                          <>
+                            <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                            Loading...
+                          </>
+                        ) : showLogs ? (
+                          'Hide Logs'
+                        ) : (
+                          <>
+                            <Terminal className="h-3 w-3 mr-1" />
+                            Show Logs
+                          </>
+                        )}
+                      </Button>
+                    )}
+                  </div>
+                  {showLogs && buildLogs && (
+                    <div className="mt-3 border border-border/60 rounded-md bg-black text-green-400 font-mono text-xs p-3 max-h-[400px] overflow-y-auto">
+                      <pre className="whitespace-pre-wrap break-words">{buildLogs}</pre>
+                    </div>
                   )}
                 </AlertDescription>
               </div>

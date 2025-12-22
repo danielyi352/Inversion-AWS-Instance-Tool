@@ -481,15 +481,38 @@ def get_build_status(
         
         # Extract error information if build failed
         error_info = None
+        error_message = None
         if build.get('buildStatus') == 'FAILED':
             # Get phase information for errors
             phases = build.get('phases', [])
             failed_phases = [p for p in phases if p.get('phaseStatus') == 'FAILED']
+            
+            # Also check for any phase with errors, even if status isn't explicitly FAILED
+            all_phases_with_context = [p for p in phases if p.get('phaseContext')]
+            
             if failed_phases:
+                failed_phase = failed_phases[0]
                 error_info = {
-                    "failed_phase": failed_phases[0].get('phaseType', 'UNKNOWN'),
-                    "phase_context": failed_phases[0].get('phaseContext', []),
+                    "failed_phase": failed_phase.get('phaseType', 'UNKNOWN'),
+                    "phase_context": failed_phase.get('phaseContext', []),
                 }
+                # Try to extract error message from phase context
+                phase_context = failed_phase.get('phaseContext', [])
+                if phase_context:
+                    # Look for error messages in context
+                    for ctx in phase_context:
+                        if isinstance(ctx, str):
+                            if 'error' in ctx.lower() or 'failed' in ctx.lower() or 'exit status' in ctx.lower():
+                                error_message = ctx
+                                break
+                    if not error_message and len(phase_context) > 0:
+                        error_message = str(phase_context[-1])  # Use last context item
+            
+            # If no error message found, try to get from build status reason
+            if not error_message:
+                status_reason = build.get('buildStatusReason', '')
+                if status_reason:
+                    error_message = status_reason
         
         # Extract image_uri from environment variables (which is a list, not a dict)
         env_vars = build.get("environment", {}).get("environmentVariables", []) or []
@@ -502,8 +525,8 @@ def get_build_status(
             "build_status": build['buildStatus'],
             "build_phase": build.get('currentPhase', 'UNKNOWN'),
             "build_complete": build['buildComplete'],
-            "start_time": build.get('startTime', {}).isoformat() if build.get('startTime') else None,
-            "end_time": build.get('endTime', {}).isoformat() if build.get('endTime') else None,
+            "start_time": build.get('startTime').isoformat() if build.get('startTime') else None,
+            "end_time": build.get('endTime').isoformat() if build.get('endTime') else None,
             "logs": {
                 "group_name": build.get('logs', {}).get('groupName'),
                 "stream_name": build.get('logs', {}).get('streamName'),
@@ -511,6 +534,7 @@ def get_build_status(
             },
             "image_uri": image_uri,
             "error_info": error_info,
+            "error_message": error_message,
             "build_number": build.get('buildNumber'),
         }
     except ClientError as e:
@@ -519,6 +543,101 @@ def get_build_status(
         raise HTTPException(
             status_code=500,
             detail=f"AWS CodeBuild error ({error_code}): {error_msg}"
+        )
+
+
+@router.get("/ecr/build-logs/{build_id}")
+def get_build_logs(
+    request: Request,
+    build_id: str,
+    region: str = "us-east-1",
+    limit: int = 1000
+):
+    """Get CloudWatch logs for a CodeBuild build."""
+    session_id = request.headers.get("X-Session-ID")
+    
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
+    
+    try:
+        creds = _get_session_credentials_from_auth(session_id)
+        region = region or creds.get('region', 'us-east-1')
+        session = _session_from_credentials_from_auth(creds, region)
+    except HTTPException as e:
+        raise
+    
+    codebuild = session.client("codebuild", region_name=region)
+    logs_client = session.client("logs", region_name=region)
+    
+    try:
+        # Get build info to find log group/stream
+        builds = codebuild.batch_get_builds(ids=[build_id])
+        if not builds['builds']:
+            raise HTTPException(status_code=404, detail="Build not found")
+        
+        build = builds['builds'][0]
+        logs_info = build.get('logs', {})
+        log_group = logs_info.get('groupName')
+        log_stream = logs_info.get('streamName')
+        
+        if not log_group or not log_stream:
+            return {
+                "status": "ok",
+                "logs": "",
+                "message": "No logs available for this build"
+            }
+        
+        # Fetch logs from CloudWatch
+        try:
+            response = logs_client.get_log_events(
+                logGroupName=log_group,
+                logStreamName=log_stream,
+                limit=limit,
+                startFromHead=False  # Get most recent logs first
+            )
+            
+            # Combine all log events
+            log_lines = []
+            for event in response.get('events', []):
+                timestamp = event.get('timestamp', 0)
+                message = event.get('message', '')
+                # Convert timestamp to readable format
+                from datetime import datetime
+                dt = datetime.fromtimestamp(timestamp / 1000)
+                log_lines.append(f"[{dt.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+            
+            # Reverse to show oldest first
+            log_lines.reverse()
+            logs_content = '\n'.join(log_lines)
+            
+            return {
+                "status": "ok",
+                "logs": logs_content,
+                "log_group": log_group,
+                "log_stream": log_stream,
+                "event_count": len(log_lines)
+            }
+        except ClientError as log_error:
+            error_code = log_error.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == 'ResourceNotFoundException':
+                return {
+                    "status": "ok",
+                    "logs": "",
+                    "message": "Log stream not found. Logs may not be available yet or may have been deleted."
+                }
+            raise
+        
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        error_msg = e.response.get('Error', {}).get('Message', str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"AWS error ({error_code}): {error_msg}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get build logs: {str(e)}"
         )
 
 
