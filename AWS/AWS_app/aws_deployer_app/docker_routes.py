@@ -269,6 +269,9 @@ async def build_image_with_codebuild(
             ]
         }
         
+        # Extract expected service for verification (needed in both try and except blocks)
+        expected_service = trust_policy['Statement'][0]['Principal']['Service']
+        
         # Policy for ECR, S3, and CloudWatch Logs access
         policy_doc = {
             "Version": "2012-10-17",
@@ -331,7 +334,6 @@ async def build_image_with_codebuild(
                 existing_trust_policy = json.loads(existing_trust_policy)
             
             # Check if trust policy matches what we need
-            expected_service = trust_policy['Statement'][0]['Principal']['Service']
             existing_statements = existing_trust_policy.get('Statement', [])
             
             # Check if trust policy is correct
