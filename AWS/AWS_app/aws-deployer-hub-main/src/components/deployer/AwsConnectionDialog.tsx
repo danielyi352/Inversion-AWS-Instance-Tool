@@ -114,7 +114,7 @@ export function AwsConnectionDialog({
         onOpenChange(newOpen);
       }}
     >
-      <DialogContent className={`sm:max-w-[550px] ${required ? '[&>button.absolute]:hidden' : ''}`}>
+      <DialogContent className={`sm:max-w-[550px] max-h-[90vh] flex flex-col ${required ? '[&>button.absolute]:hidden' : ''}`}>
         {step === 'account' ? (
           <>
             <DialogHeader>
@@ -126,8 +126,8 @@ export function AwsConnectionDialog({
               </DialogDescription>
             </DialogHeader>
             
-            <form onSubmit={handleAccountSubmit}>
-              <div className="space-y-4 py-4">
+            <form onSubmit={handleAccountSubmit} className="flex flex-col min-h-0">
+              <div className="space-y-4 py-4 overflow-y-auto flex-1 min-h-0">
                 <Alert>
                   <InfoIcon className="h-4 w-4" />
                   <AlertDescription className="text-sm">
@@ -169,8 +169,8 @@ export function AwsConnectionDialog({
                 </div>
 
                 {error && (
-                  <Alert variant="destructive">
-                    <AlertDescription>{error}</AlertDescription>
+                  <Alert variant="destructive" className="max-h-[200px] overflow-y-auto">
+                    <AlertDescription className="break-words">{error}</AlertDescription>
                   </Alert>
                 )}
               </div>
@@ -201,7 +201,7 @@ export function AwsConnectionDialog({
               </DialogDescription>
             </DialogHeader>
             
-            <div className="space-y-4 py-4">
+            <div className="space-y-4 py-4 overflow-y-auto flex-1 min-h-0">
               <Alert>
                 <InfoIcon className="h-4 w-4" />
                 <AlertDescription className="text-sm">
@@ -261,8 +261,8 @@ export function AwsConnectionDialog({
               )}
 
               {error && (
-                <Alert variant="destructive">
-                  <AlertDescription className="text-sm whitespace-pre-line">{error}</AlertDescription>
+                <Alert variant="destructive" className="max-h-[200px] overflow-y-auto">
+                  <AlertDescription className="text-sm whitespace-pre-line break-words">{error}</AlertDescription>
                 </Alert>
               )}
             </div>

@@ -146,7 +146,7 @@ export function CloudFormationLoginDialog({
         onOpenChange(newOpen);
       }}
     >
-      <DialogContent className={`sm:max-w-[600px] ${required ? '[&>button.absolute]:hidden' : ''}`}>
+      <DialogContent className={`sm:max-w-[600px] max-h-[90vh] flex flex-col ${required ? '[&>button.absolute]:hidden' : ''}`}>
         {step === 'account' ? (
           <>
             <DialogHeader>
@@ -158,8 +158,8 @@ export function CloudFormationLoginDialog({
               </DialogDescription>
             </DialogHeader>
             
-            <form onSubmit={handleAccountSubmit}>
-              <div className="space-y-4 py-4">
+            <form onSubmit={handleAccountSubmit} className="flex flex-col min-h-0">
+              <div className="space-y-4 py-4 overflow-y-auto flex-1 min-h-0">
                 <Alert>
                   <InfoIcon className="h-4 w-4" />
                   <AlertDescription className="text-xs">
@@ -201,8 +201,8 @@ export function CloudFormationLoginDialog({
                 </div>
 
                 {error && (
-                  <Alert variant="destructive">
-                    <AlertDescription>{error}</AlertDescription>
+                  <Alert variant="destructive" className="max-h-[200px] overflow-y-auto">
+                    <AlertDescription className="break-words">{error}</AlertDescription>
                   </Alert>
                 )}
               </div>
@@ -233,8 +233,8 @@ export function CloudFormationLoginDialog({
               </DialogDescription>
             </DialogHeader>
             
-            <form onSubmit={handleArnSubmit}>
-              <div className="space-y-4 py-4">
+            <form onSubmit={handleArnSubmit} className="flex flex-col min-h-0">
+              <div className="space-y-4 py-4 overflow-y-auto flex-1 min-h-0">
                 <Alert>
                   <InfoIcon className="h-4 w-4" />
                   <AlertDescription className="text-xs">
@@ -330,8 +330,8 @@ export function CloudFormationLoginDialog({
                 </div>
 
                 {error && (
-                  <Alert variant="destructive">
-                    <AlertDescription>{error}</AlertDescription>
+                  <Alert variant="destructive" className="max-h-[200px] overflow-y-auto">
+                    <AlertDescription className="break-words">{error}</AlertDescription>
                   </Alert>
                 )}
               </div>
