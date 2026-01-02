@@ -241,78 +241,110 @@ async def build_image_with_codebuild(
         role_name = f"InversionCodeBuildRole-{account_id}"
         role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
         
+        # Trust policy for CodeBuild
+        trust_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "codebuild.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole"
+                }
+            ]
+        }
+        
+        # Policy for ECR, S3, and CloudWatch Logs access
+        policy_doc = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:GetObjectVersion",
+                        "s3:PutObject"
+                    ],
+                    "Resource": f"arn:aws:s3:::{s3_bucket}/*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:ListBucket",
+                        "s3:GetBucketLocation"
+                    ],
+                    "Resource": f"arn:aws:s3:::{s3_bucket}"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecr:GetAuthorizationToken"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecr:BatchCheckLayerAvailability",
+                        "ecr:GetDownloadUrlForLayer",
+                        "ecr:BatchGetImage",
+                        "ecr:PutImage",
+                        "ecr:InitiateLayerUpload",
+                        "ecr:UploadLayerPart",
+                        "ecr:CompleteLayerUpload"
+                    ],
+                    "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents"
+                    ],
+                    "Resource": f"arn:aws:logs:{region}:{account_id}:log-group:/aws/codebuild/*"
+                }
+            ]
+        }
+        
         try:
-            iam.get_role(RoleName=role_name)
+            existing_role = iam.get_role(RoleName=role_name)
+            # Role exists - verify and update trust policy if needed
+            existing_trust_policy = existing_role['Role']['AssumeRolePolicyDocument']
+            # Compare trust policies (need to parse JSON string if it's a string)
+            if isinstance(existing_trust_policy, str):
+                existing_trust_policy = json.loads(existing_trust_policy)
+            
+            # Check if trust policy matches what we need
+            expected_service = trust_policy['Statement'][0]['Principal']['Service']
+            existing_service = existing_trust_policy.get('Statement', [{}])[0].get('Principal', {}).get('Service', '')
+            
+            if existing_service != expected_service:
+                # Update trust policy
+                print(f"[DEBUG] Updating trust policy for role {role_name} to allow {expected_service}")
+                iam.update_assume_role_policy(
+                    RoleName=role_name,
+                    PolicyDocument=json.dumps(trust_policy)
+                )
+                # Wait for policy to propagate
+                time.sleep(2)
+            
+            # Always update the inline policy to ensure it has correct permissions
+            try:
+                iam.put_role_policy(
+                    RoleName=role_name,
+                    PolicyName="CodeBuildPolicy",
+                    PolicyDocument=json.dumps(policy_doc)
+                )
+                time.sleep(1)  # Wait for policy to propagate
+            except ClientError as policy_error:
+                print(f"[WARNING] Failed to update role policy: {policy_error}")
+                
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchEntity':
                 # Create service role for CodeBuild
-                trust_policy = {
-                    "Version": "2012-10-17",
-                    "Statement": [
-                        {
-                            "Effect": "Allow",
-                            "Principal": {
-                                "Service": "codebuild.amazonaws.com"
-                            },
-                            "Action": "sts:AssumeRole"
-                        }
-                    ]
-                }
-                
-                # Policy for ECR, S3, and CloudWatch Logs access
-                policy_doc = {
-                    "Version": "2012-10-17",
-                    "Statement": [
-                        {
-                            "Effect": "Allow",
-                            "Action": [
-                                "s3:GetObject",
-                                "s3:GetObjectVersion",
-                                "s3:PutObject"
-                            ],
-                            "Resource": f"arn:aws:s3:::{s3_bucket}/*"
-                        },
-                        {
-                            "Effect": "Allow",
-                            "Action": [
-                                "s3:ListBucket",
-                                "s3:GetBucketLocation"
-                            ],
-                            "Resource": f"arn:aws:s3:::{s3_bucket}"
-                        },
-                        {
-                            "Effect": "Allow",
-                            "Action": [
-                                "ecr:GetAuthorizationToken"
-                            ],
-                            "Resource": "*"
-                        },
-                        {
-                            "Effect": "Allow",
-                            "Action": [
-                                "ecr:BatchCheckLayerAvailability",
-                                "ecr:GetDownloadUrlForLayer",
-                                "ecr:BatchGetImage",
-                                "ecr:PutImage",
-                                "ecr:InitiateLayerUpload",
-                                "ecr:UploadLayerPart",
-                                "ecr:CompleteLayerUpload"
-                            ],
-                            "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/*"
-                        },
-                        {
-                            "Effect": "Allow",
-                            "Action": [
-                                "logs:CreateLogGroup",
-                                "logs:CreateLogStream",
-                                "logs:PutLogEvents"
-                            ],
-                            "Resource": f"arn:aws:logs:{region}:{account_id}:log-group:/aws/codebuild/*"
-                        }
-                    ]
-                }
-
-                
+                print(f"[DEBUG] Creating CodeBuild service role: {role_name}")
                 iam.create_role(
                     RoleName=role_name,
                     AssumeRolePolicyDocument=json.dumps(trust_policy),
@@ -330,6 +362,8 @@ async def build_image_with_codebuild(
                 
                 # Wait for policy to propagate
                 time.sleep(1)
+            else:
+                raise
         
         # Step 5: Create or get CodeBuild project
         project_name = f"inversion-build-{repository.replace('_', '-')}"

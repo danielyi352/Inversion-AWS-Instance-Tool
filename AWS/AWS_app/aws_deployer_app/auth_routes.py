@@ -24,6 +24,27 @@ router = APIRouter(prefix="/api", tags=["auth"])
 sessions: Dict[str, Dict[str, Any]] = {}
 
 
+def _get_caller_identity(access_key: str, secret_key: str, region: str = "us-east-1") -> Optional[str]:
+    """
+    Get the AWS identity ARN that the backend is currently using.
+    
+    Returns:
+        str: The ARN of the caller identity (user or role), or None if unable to determine
+    """
+    try:
+        sts = boto3.client(
+            'sts',
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region
+        )
+        response = sts.get_caller_identity()
+        return response.get('Arn')
+    except Exception as e:
+        print(f"Warning: Failed to get caller identity: {e}")
+        return None
+
+
 def _get_your_aws_credentials():
     """
     Get your AWS account credentials for assuming roles.
@@ -308,6 +329,15 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
     # Get your AWS credentials (for assuming the role)
     your_access_key, your_secret_key = _get_your_aws_credentials()
     
+    # Create IAM client to check if role exists first
+    # Note: We can't check roles in other accounts directly, but we can try to assume and see what error we get
+    iam_client = boto3.client(
+        'iam',
+        aws_access_key_id=your_access_key,
+        aws_secret_access_key=your_secret_key,
+        region_name=region
+    )
+    
     # Create STS client with your credentials
     sts = boto3.client(
         'sts',
@@ -320,6 +350,9 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
     # CloudFormation can take 30-60 seconds to create the role
     max_attempts = 24  # 24 attempts * 5 seconds = 2 minutes max
     retry_delay = 5  # Start with 5 seconds
+    
+    # Track if we've seen AccessDenied - if we get it on first attempt, role probably doesn't exist
+    first_attempt = True
     
     for attempt in range(max_attempts):
         try:
@@ -376,25 +409,69 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
                     raise HTTPException(
                         status_code=404,
                         detail=(
-                            f"Role not found after {max_attempts} attempts. "
-                            f"The CloudFormation stack may still be creating. "
-                            f"Please wait a few more minutes and try again, or verify the stack completed successfully."
+                            f"Role 'InversionDeployerRole' not found in account {account_id}.\n\n"
+                            f"The CloudFormation stack hasn't been created yet.\n\n"
+                            f"To fix this:\n"
+                            f"1. Click 'Open AWS Console' button in the login dialog\n"
+                            f"2. In the AWS CloudFormation console, verify the TrustARN parameter is set to: arn:aws:iam::851725483944:user/my-tool-backend\n"
+                            f"3. Click 'Create stack' and wait for it to complete (usually 1-2 minutes)\n"
+                            f"4. Return here and click 'Verify Connection' again"
                         )
                     )
             
             elif error_code == 'AccessDenied':
+                # AccessDenied can mean:
+                # 1. Role doesn't exist (AWS sometimes returns this instead of NoSuchEntity)
+                # 2. Trust policy doesn't match
+                # 3. External ID mismatch
+                
+                # If this is the first attempt and we get AccessDenied immediately,
+                # it's likely the role doesn't exist
+                if first_attempt:
+                    # Try to get more info - check if we can describe the role
+                    # (This won't work for cross-account, but we can try)
+                    try:
+                        # This will fail for cross-account, but gives us a chance to catch NoSuchEntity
+                        iam_client.get_role(RoleName='InversionDeployerRole')
+                    except ClientError as iam_error:
+                        iam_error_code = iam_error.response.get('Error', {}).get('Code', 'Unknown')
+                        if iam_error_code == 'NoSuchEntity':
+                            raise HTTPException(
+                                status_code=404,
+                                detail=(
+                                    f"Role 'InversionDeployerRole' not found in account {account_id}.\n\n"
+                                    f"The CloudFormation stack hasn't been created yet.\n\n"
+                                    f"To fix this:\n"
+                                    f"1. Click 'Open AWS Console' button in the login dialog\n"
+                                    f"2. In the AWS CloudFormation console, verify the TrustARN parameter is set to: arn:aws:iam::851725483944:user/my-tool-backend\n"
+                                    f"3. Click 'Create stack' and wait for it to complete (usually 1-2 minutes)\n"
+                                    f"4. Return here and click 'Verify Connection' again"
+                                )
+                            )
+                
+                # If we get here, the role probably exists but trust policy is wrong
                 # Trust relationship issue - provide actionable error
                 trust_arn = os.environ.get('TRUST_ARN', '').strip()
                 if not trust_arn:
                     service_account_id = os.environ.get('YOUR_AWS_ACCOUNT_ID', '').strip()
                     trust_arn = f"arn:aws:iam::{service_account_id}:root" if service_account_id else "your backend account"
                 
+                # Get the actual ARN being used by the backend
+                actual_arn = _get_caller_identity(your_access_key, your_secret_key, region)
+                
                 error_detail = (
-                    f"Access denied. This usually means:\n"
-                    f"1. The Trust ARN in the CloudFormation stack doesn't match: {trust_arn}\n"
-                    f"2. External ID mismatch (expected: '{external_id}' if configured)\n"
-                    f"3. The role trust policy is incorrect\n\n"
-                    f"Please verify the CloudFormation stack was created with the correct TrustARN parameter."
+                    f"Access denied when trying to assume role '{role_arn}'.\n\n"
+                    f"This usually means:\n"
+                    f"1. The CloudFormation stack hasn't been created yet (most likely)\n"
+                    f"   → Go to AWS CloudFormation Console in account {account_id} and create the stack first\n\n"
+                    f"2. OR the Trust ARN in the CloudFormation stack doesn't match:\n"
+                    f"   - Expected: {trust_arn}\n"
+                    f"   - Actual (backend using): {actual_arn or 'Unable to determine'}\n\n"
+                    f"3. OR External ID mismatch (expected: '{external_id}' if configured)\n\n"
+                    f"To fix:\n"
+                    f"1. Make sure you've created the CloudFormation stack in account {account_id}\n"
+                    f"2. Verify the TrustARN parameter in the stack is: {actual_arn or trust_arn}\n"
+                    f"3. Wait for stack creation to complete, then try again"
                 )
                 raise HTTPException(status_code=403, detail=error_detail)
             
@@ -410,6 +487,8 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
                     status_code=401,
                     detail=f"Failed to assume role: {error_code} - {error_msg}"
                 )
+            
+            first_attempt = False
         
         except HTTPException:
             # Re-raise HTTP exceptions
@@ -480,6 +559,31 @@ def assume_role_login(body: AssumeRoleRequest):
     except ClientError as e:
         error_code = e.response.get('Error', {}).get('Code', 'Unknown')
         error_msg = e.response.get('Error', {}).get('Message', str(e))
+        
+        if error_code == 'AccessDenied':
+            # Get the expected TrustARN
+            trust_arn = os.environ.get('TRUST_ARN', '').strip()
+            if not trust_arn:
+                service_account_id = os.environ.get('YOUR_AWS_ACCOUNT_ID', '').strip()
+                trust_arn = f"arn:aws:iam::{service_account_id}:root" if service_account_id else "your backend account"
+            
+            # Get the actual ARN being used by the backend
+            actual_arn = _get_caller_identity(your_access_key, your_secret_key, body.region)
+            
+            error_detail = (
+                f"Access denied. This usually means:\n"
+                f"1. The Trust ARN in the CloudFormation stack doesn't match the backend's identity\n"
+                f"   - Expected (from TRUST_ARN env var or CloudFormation): {trust_arn}\n"
+                f"   - Actual (backend is using): {actual_arn or 'Unable to determine'}\n"
+                f"2. External ID mismatch (if configured)\n"
+                f"3. The role trust policy is incorrect\n\n"
+                f"To fix this:\n"
+                f"- If running locally: Set TRUST_ARN environment variable to match your IAM user/role ARN\n"
+                f"- If running on a hosted server: Update the CloudFormation stack's TrustARN parameter to: {actual_arn or 'your backend IAM role/user ARN'}\n"
+                f"- Or update your backend's AWS credentials to match the TrustARN in the CloudFormation stack"
+            )
+            raise HTTPException(status_code=403, detail=error_detail)
+        
         raise HTTPException(
             status_code=401,
             detail=f"Failed to assume role: {error_code} - {error_msg}. Please verify the role ARN and trust relationship."
