@@ -114,6 +114,7 @@ async def build_image_with_codebuild(
                 raise
         
         # Step 2: Ensure S3 bucket exists for source code
+        bucket_created = False
         try:
             s3.head_bucket(Bucket=s3_bucket)
         except ClientError as e:
@@ -124,6 +125,19 @@ async def build_image_with_codebuild(
                         Bucket=s3_bucket,
                         CreateBucketConfiguration={'LocationConstraint': region} if region != 'us-east-1' else {}
                     )
+                    bucket_created = True
+                    # Wait for bucket to be available (S3 can take a moment)
+                    print(f"[DEBUG] Waiting for S3 bucket {s3_bucket} to be available...")
+                    for attempt in range(5):
+                        try:
+                            s3.head_bucket(Bucket=s3_bucket)
+                            print(f"[DEBUG] S3 bucket {s3_bucket} is available")
+                            break
+                        except ClientError:
+                            if attempt < 4:
+                                time.sleep(1)
+                            else:
+                                raise
                 except ClientError as create_err:
                     if create_err.response.get('Error', {}).get('Code') != 'BucketAlreadyOwnedByYou':
                         raise
@@ -323,12 +337,13 @@ async def build_image_with_codebuild(
             if existing_service != expected_service:
                 # Update trust policy
                 print(f"[DEBUG] Updating trust policy for role {role_name} to allow {expected_service}")
-                iam.update_assume_role_policy(
-                    RoleName=role_name,
-                    PolicyDocument=json.dumps(trust_policy)
-                )
-                # Wait for policy to propagate
-                time.sleep(2)
+            iam.update_assume_role_policy(
+                RoleName=role_name,
+                PolicyDocument=json.dumps(trust_policy)
+            )
+            # Wait for trust policy to propagate (IAM can take a few seconds)
+            print(f"[DEBUG] Waiting for IAM trust policy to propagate...")
+            time.sleep(3)
             
             # Always update the inline policy to ensure it has correct permissions
             try:
@@ -337,7 +352,9 @@ async def build_image_with_codebuild(
                     PolicyName="CodeBuildPolicy",
                     PolicyDocument=json.dumps(policy_doc)
                 )
-                time.sleep(1)  # Wait for policy to propagate
+                # Wait for inline policy to propagate
+                print(f"[DEBUG] Waiting for IAM inline policy to propagate...")
+                time.sleep(2)
             except ClientError as policy_error:
                 print(f"[WARNING] Failed to update role policy: {policy_error}")
                 
@@ -351,8 +368,18 @@ async def build_image_with_codebuild(
                     Description="Service role for Inversion CodeBuild projects"
                 )
                 
-                # Wait a moment for role to be available
-                time.sleep(2)
+                # Wait for role to be available and verify it exists
+                print(f"[DEBUG] Waiting for IAM role {role_name} to be available...")
+                for attempt in range(10):
+                    try:
+                        iam.get_role(RoleName=role_name)
+                        print(f"[DEBUG] IAM role {role_name} is available")
+                        break
+                    except ClientError:
+                        if attempt < 9:
+                            time.sleep(1)
+                        else:
+                            raise
                 
                 iam.put_role_policy(
                     RoleName=role_name,
@@ -360,8 +387,9 @@ async def build_image_with_codebuild(
                     PolicyDocument=json.dumps(policy_doc)
                 )
                 
-                # Wait for policy to propagate
-                time.sleep(1)
+                # Wait for policy to propagate (IAM can take a few seconds)
+                print(f"[DEBUG] Waiting for IAM policy to propagate...")
+                time.sleep(3)
             else:
                 raise
         
@@ -371,6 +399,7 @@ async def build_image_with_codebuild(
         # S3 location for CodeBuild (without s3:// prefix)
         s3_location = f"{s3_bucket}/{s3_key}"
         
+        project_created = False
         try:
             codebuild.create_project(
                 name=project_name,
@@ -397,6 +426,10 @@ async def build_image_with_codebuild(
                 },
                 serviceRole=role_arn,
             )
+            project_created = True
+            # Wait for project to be available (CodeBuild can take a moment)
+            print(f"[DEBUG] Waiting for CodeBuild project {project_name} to be available...")
+            time.sleep(2)
         except ClientError as e:
             if e.response['Error']['Code'] != 'ResourceAlreadyExistsException':
                 raise
@@ -426,12 +459,57 @@ async def build_image_with_codebuild(
                 },
                 serviceRole=role_arn,
             )
+            # Wait after update as well (CodeBuild updates can take a moment to propagate)
+            print(f"[DEBUG] Waiting for CodeBuild project update to propagate...")
+            time.sleep(2)
         
-        # Step 6: Start the build
-        build_response = codebuild.start_build(
-            projectName=project_name,
-            sourceLocationOverride=s3_location,
-        )
+        # Step 6: Start the build with retry logic for resource-not-ready errors
+        max_build_attempts = 3
+        build_response = None
+        last_error = None
+        for build_attempt in range(max_build_attempts):
+            try:
+                build_response = codebuild.start_build(
+                    projectName=project_name,
+                    sourceLocationOverride=s3_location,
+                )
+                # Success - break out of retry loop
+                break
+            except ClientError as build_err:
+                error_code = build_err.response.get('Error', {}).get('Code', '')
+                error_msg = build_err.response.get('Error', {}).get('Message', '')
+                last_error = build_err
+                
+                # Check if it's a resource-not-ready error that we should retry
+                retryable_errors = [
+                    'InvalidInputException',  # Service role not ready
+                    'ResourceNotFoundException',  # Project not ready yet
+                ]
+                
+                # Also check error message for common resource-not-ready patterns
+                is_retryable = (
+                    error_code in retryable_errors or
+                    'not authorized' in error_msg.lower() or
+                    'not found' in error_msg.lower() or
+                    'does not exist' in error_msg.lower()
+                )
+                
+                if is_retryable and build_attempt < max_build_attempts - 1:
+                    # Wait before retrying (exponential backoff)
+                    wait_time = (build_attempt + 1) * 2
+                    print(f"[DEBUG] Build start failed (attempt {build_attempt + 1}/{max_build_attempts}): {error_code} - {error_msg}")
+                    print(f"[DEBUG] Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Not retryable or max attempts reached - raise the error
+                    raise
+        
+        if build_response is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to start build after {max_build_attempts} attempts. Last error: {last_error.response.get('Error', {}).get('Message', 'Unknown error')}"
+            )
         
         build_id_arn = build_response['build']['id']
         
