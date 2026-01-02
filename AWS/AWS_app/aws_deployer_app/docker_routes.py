@@ -332,18 +332,62 @@ async def build_image_with_codebuild(
             
             # Check if trust policy matches what we need
             expected_service = trust_policy['Statement'][0]['Principal']['Service']
-            existing_service = existing_trust_policy.get('Statement', [{}])[0].get('Principal', {}).get('Service', '')
+            existing_statements = existing_trust_policy.get('Statement', [])
             
-            if existing_service != expected_service:
+            # Check if trust policy is correct
+            trust_policy_correct = False
+            if existing_statements:
+                existing_statement = existing_statements[0]
+                existing_principal = existing_statement.get('Principal', {})
+                existing_service = existing_principal.get('Service', '')
+                existing_action = existing_statement.get('Action', '')
+                
+                if (existing_service == expected_service and 
+                    existing_action == 'sts:AssumeRole' and
+                    existing_statement.get('Effect') == 'Allow'):
+                    trust_policy_correct = True
+                    print(f"[DEBUG] Trust policy is correct: {existing_service}")
+            
+            if not trust_policy_correct:
                 # Update trust policy
                 print(f"[DEBUG] Updating trust policy for role {role_name} to allow {expected_service}")
-            iam.update_assume_role_policy(
-                RoleName=role_name,
-                PolicyDocument=json.dumps(trust_policy)
-            )
-            # Wait for trust policy to propagate (IAM can take a few seconds)
-            print(f"[DEBUG] Waiting for IAM trust policy to propagate...")
-            time.sleep(3)
+                iam.update_assume_role_policy(
+                    RoleName=role_name,
+                    PolicyDocument=json.dumps(trust_policy)
+                )
+                # Wait for trust policy to propagate (IAM can take 5-10 seconds)
+                print(f"[DEBUG] Waiting for IAM trust policy to propagate...")
+                time.sleep(5)
+                
+                # Verify the trust policy was updated correctly
+                for verify_attempt in range(5):
+                    try:
+                        updated_role = iam.get_role(RoleName=role_name)
+                        updated_trust_policy = updated_role['Role']['AssumeRolePolicyDocument']
+                        if isinstance(updated_trust_policy, str):
+                            updated_trust_policy = json.loads(updated_trust_policy)
+                        updated_statements = updated_trust_policy.get('Statement', [])
+                        if updated_statements:
+                            updated_statement = updated_statements[0]
+                            updated_principal = updated_statement.get('Principal', {})
+                            updated_service = updated_principal.get('Service', '')
+                            if (updated_service == expected_service and 
+                                updated_statement.get('Action') == 'sts:AssumeRole' and
+                                updated_statement.get('Effect') == 'Allow'):
+                                print(f"[DEBUG] Trust policy verified: {updated_service}")
+                                break
+                        print(f"[DEBUG] Trust policy not yet updated (attempt {verify_attempt + 1}/5), waiting...")
+                        time.sleep(2)
+                    except Exception as verify_err:
+                        print(f"[DEBUG] Error verifying trust policy: {verify_err}")
+                        if verify_attempt < 4:
+                            time.sleep(2)
+                        else:
+                            raise
+            else:
+                # Trust policy is correct, but wait a bit to ensure it's fully propagated
+                print(f"[DEBUG] Trust policy is correct, waiting for IAM propagation...")
+                time.sleep(2)
             
             # Always update the inline policy to ensure it has correct permissions
             try:
@@ -354,9 +398,14 @@ async def build_image_with_codebuild(
                 )
                 # Wait for inline policy to propagate
                 print(f"[DEBUG] Waiting for IAM inline policy to propagate...")
-                time.sleep(2)
+                time.sleep(3)
             except ClientError as policy_error:
                 print(f"[WARNING] Failed to update role policy: {policy_error}")
+            
+            # Final wait to ensure all IAM changes are fully propagated before starting build
+            # IAM changes can take 5-10 seconds to propagate across all AWS services
+            print(f"[DEBUG] Final wait for IAM changes to fully propagate...")
+            time.sleep(3)
                 
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchEntity':
@@ -381,14 +430,42 @@ async def build_image_with_codebuild(
                         else:
                             raise
                 
+                # Wait a bit more for role to be fully ready
+                time.sleep(2)
+                
                 iam.put_role_policy(
                     RoleName=role_name,
                     PolicyName="CodeBuildPolicy",
                     PolicyDocument=json.dumps(policy_doc)
                 )
                 
-                # Wait for policy to propagate (IAM can take a few seconds)
+                # Wait for policy to propagate (IAM can take 5-10 seconds)
                 print(f"[DEBUG] Waiting for IAM policy to propagate...")
+                time.sleep(5)
+                
+                # Verify the role has correct trust policy
+                for verify_attempt in range(5):
+                    try:
+                        verify_role = iam.get_role(RoleName=role_name)
+                        verify_trust_policy = verify_role['Role']['AssumeRolePolicyDocument']
+                        if isinstance(verify_trust_policy, str):
+                            verify_trust_policy = json.loads(verify_trust_policy)
+                        verify_service = verify_trust_policy.get('Statement', [{}])[0].get('Principal', {}).get('Service', '')
+                        if verify_service == expected_service:
+                            print(f"[DEBUG] Trust policy verified: {verify_service}")
+                            break
+                        else:
+                            print(f"[DEBUG] Trust policy verification failed (attempt {verify_attempt + 1}/5), waiting...")
+                            time.sleep(2)
+                    except Exception as verify_err:
+                        print(f"[DEBUG] Error verifying trust policy: {verify_err}")
+                        if verify_attempt < 4:
+                            time.sleep(2)
+                        else:
+                            raise
+                
+                # Final wait to ensure all IAM changes are fully propagated before starting build
+                print(f"[DEBUG] Final wait for IAM changes to fully propagate...")
                 time.sleep(3)
             else:
                 raise
