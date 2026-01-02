@@ -51,6 +51,33 @@ app.include_router(file_transfer_router)
 
 
 # ------------------------------------------------------------------------------
+# Root and Health Check Endpoints
+# ------------------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    """Root endpoint - returns API information."""
+    return {
+        "name": "Inversion Deployer API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "docs": "/docs",
+            "api": "/api"
+        }
+    }
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint for monitoring."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+# ------------------------------------------------------------------------------
 # Pydantic models
 # ------------------------------------------------------------------------------
 
