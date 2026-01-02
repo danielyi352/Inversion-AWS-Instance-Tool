@@ -179,16 +179,65 @@ def _ensure_iam_role(iam_client, role_name: str, account_id: str, log_callback=N
     if log_callback:
         log_callback(_log_message(f"Checking IAM role: {role_name}"))
     
+    # Trust policy for EC2
+    trust_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }
+    
     try:
         # Check if role exists
         role = iam_client.get_role(RoleName=role_name)
         role_arn = role['Role']['Arn']
         
-        # Verify instance profile exists
+        # Verify role has correct trust policy
+        existing_trust_policy = role['Role']['AssumeRolePolicyDocument']
+        if isinstance(existing_trust_policy, str):
+            existing_trust_policy = json.loads(existing_trust_policy)
+        
+        expected_service = trust_policy['Statement'][0]['Principal']['Service']
+        existing_service = existing_trust_policy.get('Statement', [{}])[0].get('Principal', {}).get('Service', '')
+        
+        if existing_service != expected_service:
+            # Update trust policy
+            if log_callback:
+                log_callback(_log_message(f"Updating trust policy for role {role_name} to allow {expected_service}"))
+            iam_client.update_assume_role_policy(
+                RoleName=role_name,
+                PolicyDocument=json.dumps(trust_policy)
+            )
+            time.sleep(2)  # Wait for policy to propagate
+        
+        # Verify instance profile exists and is correctly configured
         try:
             profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
-            if log_callback:
-                log_callback(_log_message(f"IAM role {role_name} and instance profile already exist"))
+            # Check if role is attached to instance profile
+            roles = [r['RoleName'] for r in profile['InstanceProfile'].get('Roles', [])]
+            if role_name not in roles:
+                # Role not attached - attach it
+                if log_callback:
+                    log_callback(_log_message(f"Attaching role {role_name} to instance profile"))
+                try:
+                    iam_client.add_role_to_instance_profile(
+                        InstanceProfileName=role_name,
+                        RoleName=role_name
+                    )
+                    # Wait for attachment to propagate
+                    time.sleep(2)
+                except ClientError as add_err:
+                    if add_err.response['Error']['Code'] not in ['LimitExceeded', 'EntityAlreadyExists']:
+                        raise
+            else:
+                if log_callback:
+                    log_callback(_log_message(f"IAM role {role_name} and instance profile already exist and are correctly configured"))
         except ClientError:
             # Role exists but instance profile doesn't - create it
             if log_callback:
@@ -202,7 +251,7 @@ def _ensure_iam_role(iam_client, role_name: str, account_id: str, log_callback=N
             # Attach role to instance profile
             try:
                 profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
-                roles = [r['RoleName'] for r in profile['InstanceProfile']['Roles']]
+                roles = [r['RoleName'] for r in profile['InstanceProfile'].get('Roles', [])]
                 if role_name not in roles:
                     iam_client.add_role_to_instance_profile(
                         InstanceProfileName=role_name,
@@ -216,7 +265,7 @@ def _ensure_iam_role(iam_client, role_name: str, account_id: str, log_callback=N
             for attempt in range(10):
                 try:
                     profile = iam_client.get_instance_profile(InstanceProfileName=role_name)
-                    if profile['InstanceProfile']['Roles']:
+                    if profile['InstanceProfile'].get('Roles'):
                         break
                 except ClientError:
                     pass
@@ -228,20 +277,6 @@ def _ensure_iam_role(iam_client, role_name: str, account_id: str, log_callback=N
             # Role doesn't exist, create it
             if log_callback:
                 log_callback(_log_message(f"Creating IAM role: {role_name}"))
-            
-            # Trust policy for EC2
-            trust_policy = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {
-                            "Service": "ec2.amazonaws.com"
-                        },
-                        "Action": "sts:AssumeRole"
-                    }
-                ]
-            }
             
             # Create role
             role = iam_client.create_role(
