@@ -81,13 +81,16 @@ export const AWS_REGIONS = [
   { value: 'us-west-2', label: 'US West (Oregon)' },
 ] as const;
 
+// Note: P3 instances are being retired by AWS. Use P4 or P5 instances instead.
 export const INSTANCE_TYPES = [
   { value: 't3.micro', label: 't3.micro (CPU)', category: 'CPU' },
   { value: 't3.small', label: 't3.small (CPU)', category: 'CPU' },
   { value: 't3.medium', label: 't3.medium (CPU)', category: 'CPU' },
   { value: 't3.large', label: 't3.large (CPU)', category: 'CPU' },
   { value: 'hpc7a.96xlarge', label: 'hpc7a.96xlarge (HPC)', category: 'HPC' },
-  { value: 'p3.2xlarge', label: 'p3.2xlarge (GPU)', category: 'GPU' },
-  { value: 'p3.8xlarge', label: 'p3.8xlarge (GPU)', category: 'GPU' },
+  { value: 'p4d.24xlarge', label: 'p4d.24xlarge (GPU)', category: 'GPU' },
+  { value: 'p5.48xlarge', label: 'p5.48xlarge (GPU)', category: 'GPU' },
   { value: 'g4dn.xlarge', label: 'g4dn.xlarge (GPU)', category: 'GPU' },
+  { value: 'g5.xlarge', label: 'g5.xlarge (GPU)', category: 'GPU' },
+  { value: 'g5.2xlarge', label: 'g5.2xlarge (GPU)', category: 'GPU' },
 ] as const;

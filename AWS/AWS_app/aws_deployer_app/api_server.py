@@ -502,6 +502,178 @@ def _ensure_security_group(ec2_client, security_group_name: str, repository: str
     return sg_id
 
 
+def _requires_cluster_placement_group(instance_type: str) -> bool:
+    """Check if instance type requires a cluster placement group.
+    
+    HPC instances (hpc6a, hpc6id, hpc7a, hpc7g, etc.) require cluster placement groups
+    for their high-performance networking capabilities.
+    
+    Args:
+        instance_type: EC2 instance type (e.g., 'hpc7a.96xlarge', 'g5.xlarge')
+    
+    Returns:
+        True if instance type requires cluster placement group, False otherwise
+    """
+    instance_lower = instance_type.lower()
+    # HPC instance families require cluster placement groups
+    hpc_families = ['hpc6a', 'hpc6id', 'hpc7a', 'hpc7g']
+    return any(hpc_family in instance_lower for hpc_family in hpc_families)
+
+
+def _get_hpc7a_supported_regions() -> Dict[str, str]:
+    """Get mapping of HPC7a supported regions.
+    
+    Returns:
+        Dictionary mapping region codes to region names
+    """
+    return {
+        'us-east-2': 'US East (Ohio)',
+        'eu-west-1': 'Europe (Ireland)',
+        'eu-west-3': 'Europe (Paris)',
+        'eu-north-1': 'Europe (Stockholm)',
+        'us-gov-west-1': 'AWS GovCloud (US-West)'
+    }
+
+
+def _validate_instance_type_region(ec2_client, instance_type: str, region: str, 
+                                   log_callback=None) -> None:
+    """Validate that the instance type is available in the specified region.
+    
+    For HPC7a instances, provides specific error message with supported regions.
+    
+    Args:
+        ec2_client: Boto3 EC2 client
+        instance_type: EC2 instance type (e.g., 'hpc7a.96xlarge')
+        region: AWS region code (e.g., 'us-east-2')
+        log_callback: Optional callback function for logging
+    
+    Raises:
+        HTTPException: If instance type is not available in the region
+    """
+    instance_lower = instance_type.lower()
+    
+    # Check if this is an HPC7a instance
+    if 'hpc7a' in instance_lower:
+        supported_regions = _get_hpc7a_supported_regions()
+        
+        if region not in supported_regions:
+            # Region doesn't support HPC7a - provide helpful error
+            region_list = ', '.join([f"{code} ({name})" for code, name in supported_regions.items()])
+            error_msg = (
+                f"HPC7a instances are not available in region '{region}'. "
+                f"HPC7a instances are only available in the following regions: {region_list}. "
+                f"Please use one of these regions to launch HPC7a instances."
+            )
+            if log_callback:
+                log_callback(_log_message(f"ERROR: {error_msg}"))
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        # Region is supported, but verify instance type is actually available
+        try:
+            # Check if instance type is available in any AZ in this region
+            response = ec2_client.describe_instance_type_offerings(
+                LocationType='availability-zone',
+                Filters=[
+                    {'Name': 'instance-type', 'Values': [instance_type]}
+                ]
+            )
+            
+            if not response.get('InstanceTypeOfferings'):
+                # Instance type not available in any AZ
+                region_list = ', '.join([f"{code} ({name})" for code, name in supported_regions.items()])
+                error_msg = (
+                    f"Instance type '{instance_type}' is not available in region '{region}' "
+                    f"(even though it's a supported HPC7a region). "
+                    f"HPC7a instances are available in: {region_list}. "
+                    f"This may be due to capacity constraints or the instance type not being available "
+                    f"in any availability zones in this region."
+                )
+                if log_callback:
+                    log_callback(_log_message(f"ERROR: {error_msg}"))
+                raise HTTPException(status_code=400, detail=error_msg)
+            
+            if log_callback:
+                available_azs = [offering['Location'] for offering in response['InstanceTypeOfferings']]
+                log_callback(_log_message(
+                    f"Instance type {instance_type} is available in region {region} "
+                    f"(AZs: {', '.join(available_azs)})"
+                ))
+        except ClientError as e:
+            # If describe_instance_type_offerings fails, log but don't fail
+            # (might be a permissions issue, let the actual launch fail with a clearer error)
+            if log_callback:
+                log_callback(_log_message(
+                    f"Warning: Could not verify instance type availability: {e}"
+                ))
+
+
+def _ensure_placement_group(ec2_client, account_id: str, region: str, 
+                            availability_zone: Optional[str] = None, 
+                            log_callback=None) -> Optional[str]:
+    """Ensure cluster placement group exists. Returns placement group name if created/exists.
+    
+    Args:
+        ec2_client: Boto3 EC2 client
+        account_id: AWS account ID
+        region: AWS region
+        availability_zone: Availability zone (optional, will use default if not specified)
+        log_callback: Optional callback function for logging
+    
+    Returns:
+        Placement group name if placement group is needed, None otherwise
+    """
+    placement_group_name = f"inversion-deployer-hpc-placement-group-{account_id}"
+    
+    try:
+        # Check if placement group already exists
+        response = ec2_client.describe_placement_groups(GroupNames=[placement_group_name])
+        if response['PlacementGroups']:
+            if log_callback:
+                log_callback(_log_message(f"Placement group {placement_group_name} already exists"))
+            return placement_group_name
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidPlacementGroup.Unknown':
+            # Placement group doesn't exist, create it
+            if log_callback:
+                log_callback(_log_message(f"Creating cluster placement group: {placement_group_name}"))
+            try:
+                ec2_client.create_placement_group(
+                    GroupName=placement_group_name,
+                    Strategy='cluster',
+                    TagSpecifications=[{
+                        'ResourceType': 'placement-group',
+                        'Tags': [
+                            {'Key': 'Name', 'Value': placement_group_name},
+                            {'Key': 'Purpose', 'Value': 'HPC-instance-cluster-networking'}
+                        ]
+                    }]
+                )
+                if log_callback:
+                    log_callback(_log_message(f"Created cluster placement group: {placement_group_name}"))
+                # Wait a moment for placement group to be available
+                time.sleep(1)
+                return placement_group_name
+            except ClientError as create_err:
+                error_code = create_err.response.get('Error', {}).get('Code', '')
+                if error_code == 'InvalidPlacementGroup.Duplicate':
+                    # Placement group was created between check and create
+                    if log_callback:
+                        log_callback(_log_message(f"Placement group {placement_group_name} already exists"))
+                    return placement_group_name
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to create placement group: {create_err}"
+                    )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to check placement group: {e}"
+            )
+    
+    return placement_group_name
+
+
 def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str,
                         security_group_name: str, root_device_name: str, volume_size: int,
                         repository: str, account_id: str, region: str, log_callback=None,
@@ -530,6 +702,9 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
             detail=f"Failed to get instance profile: {e}. Please ensure the instance profile exists."
         )
     
+    # Validate instance type is available in the region (especially for HPC instances)
+    _validate_instance_type_region(ec2_client, instance_type, region, log_callback)
+    
     # Build run_instances parameters
     # Note: No KeyName - all access is via SSM using the IAM instance profile
     run_params = {
@@ -553,6 +728,15 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
         'MinCount': 1,
         'MaxCount': 1
     }
+    
+    # Check if instance type requires cluster placement group (HPC instances)
+    requires_placement_group = _requires_cluster_placement_group(instance_type)
+    placement_group_name = None
+    
+    if requires_placement_group:
+        placement_group_name = _ensure_placement_group(ec2_client, account_id, region, availability_zone, log_callback)
+        if log_callback:
+            log_callback(_log_message(f"HPC instance type {instance_type} requires cluster placement group"))
     
     # Handle security groups and networking
     if subnet_id:
@@ -583,11 +767,36 @@ def _launch_ec2_instance(ec2_client, iam_client, ami_id: str, instance_type: str
                     detail=f"Failed to get security group: {e}"
                 )
         run_params['SubnetId'] = subnet_id
-        # Don't specify Placement when using SubnetId - subnet determines AZ
+        
+        # Handle placement group - if required, get subnet's AZ
+        if requires_placement_group and placement_group_name:
+            # Get subnet's AZ for placement group
+            try:
+                subnet_response = ec2_client.describe_subnets(SubnetIds=[subnet_id])
+                subnet_az = subnet_response['Subnets'][0]['AvailabilityZone']
+                run_params['Placement'] = {
+                    'GroupName': placement_group_name,
+                    'AvailabilityZone': subnet_az
+                }
+            except ClientError as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to get subnet availability zone: {e}"
+                )
+        # Note: If not using placement group, subnet determines AZ automatically
     else:
         # No subnet specified, use SecurityGroups (names) and optional Placement
         run_params['SecurityGroups'] = [security_group_name]
-        if availability_zone:
+        
+        # Handle placement group
+        if requires_placement_group and placement_group_name:
+            # Use provided AZ or let AWS choose default
+            placement_config = {'GroupName': placement_group_name}
+            if availability_zone:
+                placement_config['AvailabilityZone'] = availability_zone
+            run_params['Placement'] = placement_config
+        elif availability_zone:
+            # Not using placement group, just specify AZ
             run_params['Placement'] = {'AvailabilityZone': availability_zone}
     
     if user_data:
@@ -799,8 +1008,9 @@ def _pull_and_run_container(ssm_client, instance_id: str, ecr_registry: str, rep
     repo_lower = repository.lower()
     instance_lower = (instance_type or "").lower()
     
-    # GPU instance families: g3, g4dn, g5, p2, p3, p4d, p5, inf1, inf2, trn1
-    is_gpu_instance = any(gpu_family in instance_lower for gpu_family in ['g3', 'g4', 'g5', 'p2', 'p3', 'p4', 'p5', 'inf1', 'inf2', 'trn1'])
+    # GPU instance families: g3, g4dn, g5, p2, p4, p5, inf1, inf2, trn1
+    # Note: P3 instances are being retired by AWS - use P4 or G5 instead
+    is_gpu_instance = any(gpu_family in instance_lower for gpu_family in ['g3', 'g4', 'g5', 'p2', 'p4', 'p5', 'inf1', 'inf2', 'trn1'])
     is_cpu_repo = 'cpu' in repo_lower
     
     # Only use GPU flag if it's a GPU instance AND not a CPU repository

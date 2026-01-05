@@ -18,7 +18,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: InversionDeployerRole
-      Description: "IAM role for Inversion Deployer - allows backend service to manage EC2, ECR, SSM, S3, CodeBuild, and IAM resources"
+      Description: "IAM role for Inversion Deployer with minimum required permissions"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -32,63 +32,174 @@ Resources:
                   - HasExternalId
                   - !Ref ExternalId
                   - !Ref "AWS::NoValue"
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
-        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
-        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
-        - arn:aws:iam::aws:policy/IAMFullAccess
-        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
       Policies:
-        - PolicyName: InversionDeployerInstanceRolePolicy
+        - PolicyName: InversionDeployerMinimumPermissions
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow
+              # STS Read-Only
+              - Sid: STSReadOnly
+                Effect: Allow
                 Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+
+              # EC2 Operations
+              - Sid: EC2InstanceManagement
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeImages
+                  - ec2:DescribeSecurityGroups
+                  - ec2:CreateSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:DeleteSecurityGroup
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:DescribeTags
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeInstanceTypeOfferings
+                  - ec2:CreatePlacementGroup
+                  - ec2:DescribePlacementGroups
+                  - ec2:DeletePlacementGroup
+                Resource: "*"
+
+              # ECR Operations
+              - Sid: ECRManagement
+                Effect: Allow
+                Action:
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:ListImages
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchDeleteImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                Resource: "*"
+
+              # SSM Operations
+              - Sid: SSMOperations
+                Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                Resource: "*"
+
+              # S3 Operations (limited to specific bucket patterns)
+              - Sid: S3Operations
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:PutLifecycleConfiguration
+                Resource:
+                  - !Sub "arn:aws:s3:::inversion-deployer-temp-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::inversion-deployer-temp-${AWS::AccountId}/*"
+                  - !Sub "arn:aws:s3:::inversion-codebuild-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::inversion-codebuild-${AWS::AccountId}/*"
+
+              # IAM Operations for instance roles and CodeBuild roles
+              - Sid: IAMForInstanceRoles
+                Effect: Allow
+                Action:
+                  - iam:GetRole
                   - iam:CreateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetInstanceProfile
                   - iam:CreateInstanceProfile
                   - iam:AddRoleToInstanceProfile
-                  - iam:PassRole
-                  - iam:GetRole
-                  - iam:GetInstanceProfile
-                  - iam:PutRolePolicy
-                  - iam:GetRolePolicy
+                  - iam:TagRole
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:DeleteRole
                 Resource:
-                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/inversion-deployer-instance-role-*"
-                  - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/inversion-deployer-instance-role-*"
-                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/InversionCodeBuildRole-*"
-              - Effect: Allow
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/inversion-deployer-instance-role-${AWS::AccountId}"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/inversion-deployer-instance-role-${AWS::AccountId}"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/InversionCodeBuildRole-${AWS::AccountId}"
+
+              # Allow attaching the AWS managed SSM policy to instance roles
+              - Sid: IAMAttachSSMPolicy
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/inversion-deployer-instance-role-${AWS::AccountId}"
+                Condition:
+                  StringEquals:
+                    "iam:PolicyArn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+              # Allow passing EC2 instance role to EC2 service
+              - Sid: IAMPassEC2InstanceRole
+                Effect: Allow
                 Action:
                   - iam:PassRole
                 Resource:
-                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/InversionCodeBuildRole-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/inversion-deployer-instance-role-${AWS::AccountId}"
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": "ec2.amazonaws.com"
+
+              # Allow passing CodeBuild role to CodeBuild service
+              - Sid: IAMPassCodeBuildRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/InversionCodeBuildRole-${AWS::AccountId}"
                 Condition:
                   StringEquals:
                     "iam:PassedToService": "codebuild.amazonaws.com"
-        - PolicyName: InversionDeployerCodeBuildPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
+
+              # CodeBuild Operations - CreateProject and UpdateProject need * for resource matching
+              - Sid: CodeBuildCreateUpdateProject
+                Effect: Allow
                 Action:
                   - codebuild:CreateProject
                   - codebuild:UpdateProject
-                  - codebuild:DeleteProject
-                  - codebuild:BatchGetProjects
-                  - codebuild:StartBuild
-                  - codebuild:StopBuild
-                  - codebuild:BatchGetBuilds
-                  - codebuild:ListBuilds
-                  - codebuild:ListBuildsForProject
                 Resource: "*"
-              - Effect: Allow
+
+              # CodeBuild Operations - Other actions can use specific project pattern
+              # Note: Region is wildcarded (*) because projects can be in different regions than the stack
+              - Sid: CodeBuildOperations
+                Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:BatchGetProjects
+                Resource: !Sub "arn:aws:codebuild:*:${AWS::AccountId}:project/inversion-build-*"
+
+              # CloudWatch Logs (for CodeBuild)
+              # Note: Region is wildcarded (*) because logs are in the same region as CodeBuild projects
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:GetLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/codebuild/*"
 
 Conditions:
   HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]

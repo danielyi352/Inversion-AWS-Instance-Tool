@@ -4,7 +4,12 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Upload, Loader2, CheckCircle2, XCircle, AlertCircle, Terminal } from 'lucide-react';
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible';
+import { Upload, Loader2, CheckCircle2, XCircle, AlertCircle, Terminal, ChevronDown } from 'lucide-react';
 import { toast } from 'sonner';
 import { buildImageWithCodeBuild, getBuildStatus, getBuildLogs, clearRepository } from '@/lib/api';
 import type { AwsConfig } from '@/types/aws';
@@ -33,6 +38,8 @@ export function DockerImageUploadSection({
   const [isBuilding, setIsBuilding] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
   const [buildId, setBuildId] = useState<string | null>(null);
+  // Collapse by default if repository already has images
+  const [isOpen, setIsOpen] = useState(!repositoryStatus?.hasImages);
   const [buildStatus, setBuildStatus] = useState<{
     build_status: string;
     build_phase: string;
@@ -47,6 +54,11 @@ export function DockerImageUploadSection({
   const [buildLogs, setBuildLogs] = useState<string>('');
   const [showLogs, setShowLogs] = useState(false);
   const [loadingLogs, setLoadingLogs] = useState(false);
+
+  // Update collapsed state when repository status changes
+  useEffect(() => {
+    setIsOpen(!repositoryStatus?.hasImages);
+  }, [repositoryStatus?.hasImages]);
 
   // Poll build status if build is in progress
   useEffect(() => {
@@ -222,7 +234,7 @@ export function DockerImageUploadSection({
         <CardHeader className="pb-4">
           <CardTitle className="flex items-center gap-2 text-base font-medium">
             <Terminal className="h-4 w-4" />
-            Build & Push Docker Image
+            Repository Configuration
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -236,13 +248,36 @@ export function DockerImageUploadSection({
 
   return (
     <Card className="border-border/60 shadow-sm">
-      <CardHeader className="pb-4">
-        <CardTitle className="flex items-center gap-2 text-base font-medium">
-          <Terminal className="h-4 w-4" />
-          Build & Push Docker Image
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4">
+      {!repositoryStatus?.hasImages && (
+        <CardHeader className="pb-4">
+          <CardTitle className="flex items-center gap-2 text-base font-medium">
+            <Terminal className="h-4 w-4" />
+            Repository Configuration
+          </CardTitle>
+        </CardHeader>
+      )}
+      <CardContent className={repositoryStatus?.hasImages ? "pt-6" : ""}>
+        <Collapsible open={isOpen} onOpenChange={setIsOpen}>
+          {repositoryStatus?.hasImages && (
+            <CollapsibleTrigger asChild>
+              <Button
+                variant="ghost"
+                className="w-full justify-between mb-4"
+              >
+                <span className="flex items-center gap-2">
+                  <Terminal className="h-4 w-4" />
+                  Repository Configuration
+                </span>
+                <ChevronDown
+                  className={`h-4 w-4 transition-transform duration-200 ${
+                    isOpen ? 'transform rotate-180' : ''
+                  }`}
+                />
+              </Button>
+            </CollapsibleTrigger>
+          )}
+          <CollapsibleContent>
+            <div className="space-y-4 pt-2">
         {/* Info Alert */}
         <Alert className="bg-blue-500/10 border-blue-500/20">
           <AlertCircle className="h-4 w-4 text-blue-600" />
@@ -466,6 +501,9 @@ export function DockerImageUploadSection({
             </Button>
           )}
         </div>
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
       </CardContent>
     </Card>
   );
