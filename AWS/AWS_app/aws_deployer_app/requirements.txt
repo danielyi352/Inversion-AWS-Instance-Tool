@@ -2,6 +2,8 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 pydantic>=2.9.0
+pydantic[email]>=2.9.0  # Includes email-validator for EmailStr validation
+email-validator>=2.0.0  # Explicit dependency for EmailStr field validation
 python-multipart>=0.0.6
 
 # AWS SDK
