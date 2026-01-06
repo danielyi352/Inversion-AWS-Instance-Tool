@@ -43,12 +43,7 @@ export function InversionDeployer() {
     handleLogout,
   } = useAwsConfig();
 
-  // Auto-open login dialog if not logged in
-  useEffect(() => {
-    if (!isLoggedIn) {
-      setLoginDialogOpen(true);
-    }
-  }, [isLoggedIn]);
+  // Note: Authentication is now handled at the route level in Dashboard component
 
   return (
     <div className="min-h-screen bg-background">
@@ -83,12 +78,12 @@ export function InversionDeployer() {
 
       <main className="mx-auto max-w-7xl px-6 py-8">
         {!isLoggedIn ? (
-          // Show login prompt when not logged in
+          // Show AWS connection prompt when user is logged in but AWS is not connected
           <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-6">
             <div className="text-center space-y-4">
-              <h2 className="text-2xl font-semibold">Welcome to Inversion Deployer</h2>
+              <h2 className="text-2xl font-semibold">Connect to AWS</h2>
               <p className="text-muted-foreground">
-                Please login with your IAM Role ARN to get started
+                Please connect your AWS account to get started
               </p>
             </div>
             <Button
@@ -96,7 +91,7 @@ export function InversionDeployer() {
               size="lg"
               className="gap-2"
             >
-              Login with IAM Role ARN
+              Connect AWS Account
             </Button>
           </div>
         ) : (

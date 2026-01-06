@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -19,8 +19,8 @@ import {
 } from '@/components/ui/select';
 import { AWS_REGIONS } from '@/types/aws';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { InfoIcon, ExternalLink, CheckCircle2, Loader2 } from 'lucide-react';
-import { cloudformationLogin, cloudformationVerify } from '@/lib/api';
+import { InfoIcon, ExternalLink, CheckCircle2, Loader2, AlertTriangle } from 'lucide-react';
+import { cloudformationLogin, cloudformationVerify, getCurrentUser, checkAwsAccount } from '@/lib/api';
 import { toast } from 'sonner';
 
 interface AwsConnectionDialogProps {
@@ -44,6 +44,53 @@ export function AwsConnectionDialog({
   const [error, setError] = useState<string | null>(null);
   const [cloudFormationData, setCloudFormationData] = useState<any>(null);
   const [consoleOpened, setConsoleOpened] = useState(false);
+  const [accountError, setAccountError] = useState<string | null>(null);
+
+  // Auto-fill AWS account ID when dialog opens
+  useEffect(() => {
+    if (open && step === 'account' && !accountId) {
+      getCurrentUser()
+        .then((user) => {
+          if (user.aws_account_id) {
+            setAccountId(user.aws_account_id);
+            // Check if this account is associated with someone else
+            checkAwsAccount(user.aws_account_id)
+              .then((result) => {
+                if (result.associated_with_other_user) {
+                  setAccountError(result.message);
+                } else {
+                  setAccountError(null);
+                }
+              })
+              .catch(() => {
+                // Ignore errors when checking
+              });
+          }
+        })
+        .catch(() => {
+          // User not logged in or error - ignore
+        });
+    }
+  }, [open, step, accountId]);
+
+  // Check AWS account when user types it
+  useEffect(() => {
+    if (accountId && accountId.match(/^\d{12}$/)) {
+      checkAwsAccount(accountId)
+        .then((result) => {
+          if (result.associated_with_other_user) {
+            setAccountError(result.message);
+          } else {
+            setAccountError(null);
+          }
+        })
+        .catch(() => {
+          // Ignore errors
+        });
+    } else {
+      setAccountError(null);
+    }
+  }, [accountId]);
 
   const handleAccountSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -150,6 +197,14 @@ export function AwsConnectionDialog({
                   <p className="text-xs text-muted-foreground">
                     Your 12-digit AWS Account ID
                   </p>
+                  {accountError && (
+                    <Alert variant="destructive" className="mt-2">
+                      <AlertTriangle className="h-4 w-4" />
+                      <AlertDescription className="text-xs">
+                        {accountError}
+                      </AlertDescription>
+                    </Alert>
+                  )}
                 </div>
 
                 <div className="space-y-2">
@@ -186,7 +241,7 @@ export function AwsConnectionDialog({
                     Cancel
                   </Button>
                 )}
-                <Button type="submit" disabled={loading || !accountId || accountId.length !== 12}>
+                <Button type="submit" disabled={loading || !accountId || accountId.length !== 12 || !!accountError}>
                   {loading ? 'Preparing...' : 'Continue'}
                 </Button>
               </DialogFooter>

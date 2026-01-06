@@ -1,7 +1,5 @@
 """
-Authentication routes for AWS IAM role assumption via CloudFormation.
-Users provide their AWS Account ID, get redirected to CloudFormation console,
-and then provide the created IAM Role ARN to complete authentication.
+Authentication routes for user login (Google OAuth) and AWS IAM role assumption via CloudFormation.
 """
 
 from __future__ import annotations
@@ -9,7 +7,7 @@ from __future__ import annotations
 import os
 import uuid
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,11 +15,37 @@ import boto3
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+# Database imports
+from database import connect_to_mongodb
+from models import User, AWSConnection, AWSConnectionStatus, user_to_dict, dict_to_user, aws_connection_to_dict
+
+# Load .env file if it exists (for development)
+try:
+    from dotenv import load_dotenv
+    # Try multiple possible .env locations
+    possible_env_paths = [
+        Path(__file__).parent / '.env',  # aws_deployer_app/.env
+        Path(__file__).parent.parent / '.env',  # AWS_app/.env
+    ]
+    for env_path in possible_env_paths:
+        if env_path.exists():
+            load_dotenv(env_path, override=True)
+            break
+except ImportError:
+    pass  # python-dotenv not installed, skip
+except Exception as e:
+    print(f"Warning: Failed to load .env file: {e}")
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
-# In-memory session storage (use Redis/database in production)
-sessions: Dict[str, Dict[str, Any]] = {}
+# In-memory session storage
+# AWS sessions: for AWS role assumption credentials
+aws_sessions: Dict[str, Dict[str, Any]] = {}
+# User sessions: for authenticated users
+user_sessions: Dict[str, Dict[str, Any]] = {}
 
 
 def _get_caller_identity(access_key: str, secret_key: str, region: str = "us-east-1") -> Optional[str]:
@@ -133,11 +157,11 @@ def _get_your_aws_credentials():
 
 
 def get_session_credentials(session_id: Optional[str]) -> Dict[str, Any]:
-    """Get credentials from session, raise error if invalid/expired."""
+    """Get AWS credentials from session, raise error if invalid/expired."""
     if not session_id:
         raise HTTPException(status_code=401, detail="No session ID provided")
     
-    session = sessions.get(session_id)
+    session = aws_sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
     
@@ -150,10 +174,54 @@ def get_session_credentials(session_id: Optional[str]) -> Dict[str, Any]:
     
     if expiration < now:
         # Clean up expired session
-        sessions.pop(session_id, None)
+        aws_sessions.pop(session_id, None)
         raise HTTPException(status_code=401, detail="Session expired. Please login again.")
     
     return session
+
+
+def get_user_session(session_id: Optional[str]) -> Dict[str, Any]:
+    """Get user session, raise error if invalid/expired."""
+    if not session_id:
+        raise HTTPException(status_code=401, detail="No session ID provided")
+    
+    session = user_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    expiration = datetime.fromisoformat(session['expires_at'])
+    now = datetime.now(timezone.utc)
+    if expiration.tzinfo is None:
+        expiration = expiration.replace(tzinfo=timezone.utc)
+    
+    if expiration < now:
+        user_sessions.pop(session_id, None)
+        raise HTTPException(status_code=401, detail="Session expired. Please login again.")
+    
+    return session
+
+
+async def get_current_user(request: Request) -> User:
+    """Get current authenticated user from request headers."""
+    session_id = request.headers.get("X-User-Session-ID")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please login first.")
+    
+    user_session = get_user_session(session_id)
+    user_id = user_session.get('user_id')
+    
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    
+    # Fetch user from database
+    db = await connect_to_mongodb()
+    users_collection = db.users
+    user_doc = await users_collection.find_one({"user_id": user_id})
+    
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    return dict_to_user(user_doc)
 
 
 def session_from_credentials(credentials: Dict[str, Any], region: str):
@@ -303,10 +371,11 @@ def cloudformation_login(body: CloudFormationLoginRequest):
 
 
 @router.post("/auth/cloudformation/verify")
-def cloudformation_verify(body: CloudFormationVerifyRequest):
+async def cloudformation_verify(body: CloudFormationVerifyRequest, request: Request):
     """
     Automatically verify and connect to the customer's AWS account after stack creation.
     Computes the role ARN and attempts to assume it with retries.
+    Stores the AWS account connection in the database with uniqueness constraint.
     """
     import time
     
@@ -319,6 +388,37 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
             status_code=400,
             detail="Invalid AWS Account ID. Account ID must be 12 digits."
         )
+    
+    # Get current user from request
+    try:
+        current_user = await get_current_user(request)
+        user_id = current_user.user_id
+    except HTTPException:
+        raise HTTPException(
+            status_code=401,
+            detail="You must be logged in to connect an AWS account. Please login first."
+        )
+    
+    # Check if this AWS account ID is already associated with another user
+    db = await connect_to_mongodb()
+    users_collection = db.users
+    connections_collection = db.aws_connections
+    
+    # Check if another user has this AWS account ID
+    other_user = await users_collection.find_one({
+        "aws_account_id": account_id,
+        "user_id": {"$ne": user_id}  # Not the current user
+    })
+    
+    if other_user:
+        # Block connection - AWS account ID is already associated with another user
+        raise HTTPException(
+            status_code=409,
+            detail="This AWS account is already associated with another user account. Please use a different AWS account ID."
+        )
+    
+    # Check if current user already has this AWS account ID
+    user_has_account = current_user.aws_account_id == account_id
     
     # Compute role ARN (role name is fixed: InversionDeployerRole)
     role_arn = f"arn:aws:iam::{account_id}:role/InversionDeployerRole"
@@ -370,10 +470,10 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
             # Attempt to assume the role
             response = sts.assume_role(**assume_role_params)
             
-            # Success! Store credentials in session
+            # Success! Store credentials in AWS session
             credentials = response['Credentials']
             session_id = str(uuid.uuid4())
-            sessions[session_id] = {
+            aws_sessions[session_id] = {
                 'access_key_id': credentials['AccessKeyId'],
                 'secret_access_key': credentials['SecretAccessKey'],
                 'session_token': credentials['SessionToken'],
@@ -382,6 +482,52 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
                 'role_arn': role_arn,
                 'account_id': account_id,
             }
+            
+            # Associate AWS account ID with user account
+            await users_collection.update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {
+                        "aws_account_id": account_id,
+                        "updated_at": datetime.now(timezone.utc)
+                    }
+                }
+            )
+            
+            # Generate a new external ID for this connection
+            new_external_id = str(uuid.uuid4())
+            
+            # Store or update AWS connection in database
+            connection_data = {
+                'user_id': user_id,
+                'aws_account_id': account_id,
+                'role_arn': role_arn,
+                'region': region,
+                'status': AWSConnectionStatus.ACTIVE.value,
+                'external_id': new_external_id,
+                'claimed_at': datetime.now(timezone.utc),
+                'updated_at': datetime.now(timezone.utc),
+                'last_used_at': datetime.now(timezone.utc),
+            }
+            
+            # Check if connection already exists for this user
+            existing_user_connection = await connections_collection.find_one({
+                "user_id": user_id,
+                "aws_account_id": account_id
+            })
+            
+            if existing_user_connection:
+                # Update existing connection
+                await connections_collection.update_one(
+                    {"_id": existing_user_connection["_id"]},
+                    {"$set": connection_data}
+                )
+            else:
+                # Create new connection
+                connection_data['created_at'] = datetime.now(timezone.utc)
+                connection = AWSConnection(**connection_data)
+                conn_dict = aws_connection_to_dict(connection)
+                await connections_collection.insert_one(conn_dict)
             
             return {
                 "status": "ok",
@@ -504,9 +650,39 @@ def cloudformation_verify(body: CloudFormationVerifyRequest):
 
 
 @router.post("/auth/assume-role")
-def assume_role_login(body: AssumeRoleRequest):
+async def assume_role_login(body: AssumeRoleRequest, request: Request):
     """Complete login by assuming the IAM role created by CloudFormation."""
     try:
+        # Get current user from request
+        try:
+            current_user = await get_current_user(request)
+            user_id = current_user.user_id
+        except HTTPException:
+            raise HTTPException(
+                status_code=401,
+                detail="You must be logged in to connect an AWS account. Please login first."
+            )
+        
+        # Extract account ID from role ARN or use provided one
+        account_id = body.account_id or body.role_arn.split(':')[4]
+        
+        # Check if this AWS account ID is already associated with another user
+        db = await connect_to_mongodb()
+        users_collection = db.users
+        connections_collection = db.aws_connections
+        
+        # Check if another user has this AWS account ID
+        other_user = await users_collection.find_one({
+            "aws_account_id": account_id,
+            "user_id": {"$ne": user_id}  # Not the current user
+        })
+        
+        if other_user:
+            # Block connection - AWS account ID is already associated with another user
+            raise HTTPException(
+                status_code=409,
+                detail="This AWS account is already associated with another user account. Please use a different AWS account ID."
+            )
         # Get your AWS credentials (for assuming the role)
         your_access_key, your_secret_key = _get_your_aws_credentials()
         
@@ -534,12 +710,9 @@ def assume_role_login(body: AssumeRoleRequest):
         
         credentials = response['Credentials']
         
-        # Extract account ID from the assumed role ARN or use provided one
-        account_id = body.account_id or body.role_arn.split(':')[4]
-        
-        # Store in session
+        # Store in AWS session
         session_id = str(uuid.uuid4())
-        sessions[session_id] = {
+        aws_sessions[session_id] = {
             'access_key_id': credentials['AccessKeyId'],
             'secret_access_key': credentials['SecretAccessKey'],
             'session_token': credentials['SessionToken'],
@@ -548,6 +721,52 @@ def assume_role_login(body: AssumeRoleRequest):
             'role_arn': body.role_arn,
             'account_id': account_id,
         }
+        
+        # Associate AWS account ID with user account
+        await users_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "aws_account_id": account_id,
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        )
+        
+        # Generate a new external ID for this connection
+        new_external_id = str(uuid.uuid4())
+        
+        # Store or update AWS connection in database
+        connection_data = {
+            'user_id': user_id,
+            'aws_account_id': account_id,
+            'role_arn': body.role_arn,
+            'region': body.region,
+            'status': AWSConnectionStatus.ACTIVE.value,
+            'external_id': new_external_id,
+            'claimed_at': datetime.now(timezone.utc),
+            'updated_at': datetime.now(timezone.utc),
+            'last_used_at': datetime.now(timezone.utc),
+        }
+        
+        # Check if connection already exists for this user
+        existing_user_connection = await connections_collection.find_one({
+            "user_id": user_id,
+            "aws_account_id": account_id
+        })
+        
+        if existing_user_connection:
+            # Update existing connection
+            await connections_collection.update_one(
+                {"_id": existing_user_connection["_id"]},
+                {"$set": connection_data}
+            )
+        else:
+            # Create new connection
+            connection_data['created_at'] = datetime.now(timezone.utc)
+            connection = AWSConnection(**connection_data)
+            conn_dict = aws_connection_to_dict(connection)
+            await connections_collection.insert_one(conn_dict)
         
         return {
             "status": "ok",
@@ -607,4 +826,204 @@ def sso_login(body: LoginRequest):
         raise HTTPException(status_code=500, detail=exc.output) from exc
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail="AWS CLI not found. Please install AWS CLI.")
+
+
+# ============================================================================
+# Google OAuth Authentication Routes
+# ============================================================================
+
+class GoogleTokenRequest(BaseModel):
+    token: str = Field(..., description="Google ID token from client-side OAuth")
+
+
+@router.post("/auth/google/login")
+async def google_login(body: GoogleTokenRequest):
+    """
+    Authenticate user with Google OAuth token.
+    
+    The frontend should get the Google ID token from Google Sign-In,
+    then send it to this endpoint for verification.
+    """
+    try:
+        # Get Google OAuth client ID from environment
+        google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+        if not google_client_id:
+            raise HTTPException(
+                status_code=500,
+                detail="Google OAuth not configured. Please set GOOGLE_CLIENT_ID environment variable."
+            )
+        
+        # Verify the Google ID token
+        try:
+            token_request = google_requests.Request()
+            idinfo = id_token.verify_oauth2_token(
+                body.token,
+                token_request,
+                google_client_id
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+        
+        # Extract user information from token
+        google_user_id = idinfo.get('sub')
+        email = idinfo.get('email')
+        name = idinfo.get('name')
+        picture = idinfo.get('picture')
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="Email not provided in Google token")
+        
+        # Connect to database
+        db = await connect_to_mongodb()
+        users_collection = db.users
+        
+        # Check if user exists
+        user_doc = await users_collection.find_one({"email": email})
+        
+        if user_doc:
+            # User exists - update last login
+            user = dict_to_user(user_doc)
+            user.last_login_at = datetime.now(timezone.utc)
+            user.updated_at = datetime.now(timezone.utc)
+            # Update name/picture if changed
+            if name:
+                user.name = name
+            
+            await users_collection.update_one(
+                {"user_id": user.user_id},
+                {
+                    "$set": {
+                        "last_login_at": user.last_login_at,
+                        "updated_at": user.updated_at,
+                        "name": user.name
+                    }
+                }
+            )
+        else:
+            # New user - create account
+            user = User(
+                user_id=str(uuid.uuid4()),
+                email=email,
+                name=name,
+                auth_provider="google",
+                auth_provider_id=google_user_id,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                last_login_at=datetime.now(timezone.utc)
+            )
+            
+            user_dict = user_to_dict(user)
+            await users_collection.insert_one(user_dict)
+        
+        # Create user session
+        session_id = str(uuid.uuid4())
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)  # 7 day session
+        
+        user_sessions[session_id] = {
+            'user_id': user.user_id,
+            'email': user.email,
+            'expires_at': expires_at.isoformat(),
+            'created_at': datetime.now(timezone.utc).isoformat()
+        }
+        
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "user": {
+                "user_id": user.user_id,
+                "email": user.email,
+                "name": user.name
+            },
+            "expires_at": expires_at.isoformat(),
+            "message": "Successfully authenticated with Google"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+
+
+@router.get("/auth/me")
+async def get_current_user_info(request: Request):
+    """Get current authenticated user information."""
+    try:
+        user = await get_current_user(request)
+        return {
+            "user_id": user.user_id,
+            "email": user.email,
+            "name": user.name,
+            "auth_provider": user.auth_provider,
+            "aws_account_id": user.aws_account_id,  # Include AWS account ID for auto-fill
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching user info: {str(e)}")
+
+
+@router.post("/auth/logout")
+async def logout(request: Request):
+    """Logout current user by invalidating session."""
+    session_id = request.headers.get("X-User-Session-ID")
+    if session_id and session_id in user_sessions:
+        user_sessions.pop(session_id, None)
+    return {"status": "ok", "message": "Logged out successfully"}
+
+
+@router.get("/auth/check-aws-account/{account_id}")
+async def check_aws_account(request: Request, account_id: str):
+    """
+    Check if an AWS account ID is already associated with another user.
+    Returns information about who owns it (if anyone).
+    """
+    try:
+        current_user = await get_current_user(request)
+        user_id = current_user.user_id
+    except HTTPException:
+        raise HTTPException(
+            status_code=401,
+            detail="You must be logged in to check AWS account associations."
+        )
+    
+    # Validate account ID format
+    if not account_id.isdigit() or len(account_id) != 12:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid AWS Account ID. Account ID must be 12 digits."
+        )
+    
+    db = await connect_to_mongodb()
+    users_collection = db.users
+    
+    # Check if another user has this AWS account ID
+    other_user = await users_collection.find_one({
+        "aws_account_id": account_id,
+        "user_id": {"$ne": user_id}  # Not the current user
+    })
+    
+    if other_user:
+        return {
+            "account_id": account_id,
+            "is_associated": True,
+            "associated_with_other_user": True,
+            "message": "This AWS account is already associated with another user account."
+        }
+    elif current_user.aws_account_id == account_id:
+        return {
+            "account_id": account_id,
+            "is_associated": True,
+            "associated_with_other_user": False,
+            "associated_with_current_user": True,
+            "message": "This AWS account is already associated with your account"
+        }
+    else:
+        return {
+            "account_id": account_id,
+            "is_associated": False,
+            "associated_with_other_user": False,
+            "message": "This AWS account is not associated with any user"
+        }
 

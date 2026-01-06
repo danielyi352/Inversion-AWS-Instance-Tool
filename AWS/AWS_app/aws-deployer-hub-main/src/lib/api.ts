@@ -3,18 +3,29 @@ import type { AwsConfig, AwsMetadata, DeployResponse, RunningInstance, AssumeRol
 // Use environment variable for API base URL, fallback to local for development
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api";
 
-// Get session ID from localStorage
+// Get AWS session ID from localStorage (for AWS role assumption)
 function getSessionId(): string | null {
   return localStorage.getItem('aws_session_id');
 }
 
+// Get user session ID from localStorage (for user authentication)
+function getUserSessionId(): string | null {
+  return localStorage.getItem('user_session_id');
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const sessionId = getSessionId();
+  const userSessionId = getUserSessionId();
   const headers: HeadersInit = { "Content-Type": "application/json" };
   
-  // Add session ID to headers if available
+  // Add AWS session ID to headers if available (for AWS role assumption)
   if (sessionId) {
     headers["X-Session-ID"] = sessionId;
+  }
+  
+  // Add user session ID to headers if available (for user authentication)
+  if (userSessionId) {
+    headers["X-User-Session-ID"] = userSessionId;
   }
   
   try {
@@ -62,6 +73,76 @@ export function loginSso(profile: string, region: string) {
   return apiFetch<{ status: string; message: string }>("/sso/login", {
     method: "POST",
     body: JSON.stringify({ profile, region }),
+  });
+}
+
+export function googleLogin(token: string) {
+  return apiFetch<{
+    status: string;
+    session_id: string;
+    user: {
+      user_id: string;
+      email: string;
+      name: string | null;
+    };
+    expires_at: string;
+    message: string;
+  }>("/auth/google/login", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+}
+
+export function getCurrentUser() {
+  const userSessionId = getUserSessionId();
+  if (!userSessionId) {
+    return Promise.reject(new Error("Not authenticated"));
+  }
+  
+  return fetch(`${API_BASE}/auth/me`, {
+    headers: {
+      "X-User-Session-ID": userSessionId,
+    },
+  }).then(async (res) => {
+    if (!res.ok) {
+      throw new Error("Not authenticated");
+    }
+    return res.json();
+  });
+}
+
+export function checkAwsAccount(accountId: string) {
+  const userSessionId = getUserSessionId();
+  if (!userSessionId) {
+    return Promise.reject(new Error("Not authenticated"));
+  }
+  
+  return apiFetch<{
+    account_id: string;
+    is_associated: boolean;
+    associated_with_other_user: boolean;
+    associated_with_current_user?: boolean;
+    other_user_email?: string;
+    message: string;
+  }>(`/auth/check-aws-account/${accountId}`, {
+    method: "GET",
+  });
+}
+
+export function logout() {
+  const userSessionId = getUserSessionId();
+  if (!userSessionId) {
+    return Promise.resolve({ status: "ok" });
+  }
+  
+  return fetch(`${API_BASE}/auth/logout`, {
+    method: "POST",
+    headers: {
+      "X-User-Session-ID": userSessionId,
+    },
+  }).then(async (res) => {
+    localStorage.removeItem('user_session_id');
+    return res.json();
   });
 }
 

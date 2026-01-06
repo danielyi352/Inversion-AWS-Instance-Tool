@@ -391,15 +391,24 @@ export function useAwsConfig() {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    // Logout from user session (Google OAuth)
+    try {
+      const { logout } = await import('@/lib/api');
+      await logout();
+    } catch (err) {
+      console.error('Failed to logout user session:', err);
+    }
+    
     // Close any active deployment streams
     if (deploySource) {
       deploySource.close();
       setDeploySource(null);
     }
     
-    // Clear session
+    // Clear AWS session
     localStorage.removeItem('aws_session_id');
+    localStorage.removeItem('user_session_id');
     setIsLoggedIn(false);
     
     // Clear state
@@ -407,6 +416,9 @@ export function useAwsConfig() {
     setSelectedInstance(null);
     setMetadata({ repositories: [], securityGroups: [] });
     setRepositoryStatus(null);
+    
+    // Redirect to login page
+    window.location.href = '/login';
     setProgress(0);
     
     addLog('Logged out successfully', 'info');

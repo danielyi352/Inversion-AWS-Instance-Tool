@@ -36,9 +36,16 @@ from auth_routes import router as auth_router, get_session_credentials, session_
 app = FastAPI(title="Inversion Deployer API", version="1.0.0")
 
 # Allow local dev server (Vite) to talk to the API.
+# Explicitly allow localhost and 127.0.0.1 for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "*"  # Allow all for production flexibility
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
