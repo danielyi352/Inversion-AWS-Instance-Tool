@@ -470,8 +470,216 @@ async def cloudformation_verify(body: CloudFormationVerifyRequest, request: Requ
             # Attempt to assume the role
             response = sts.assume_role(**assume_role_params)
             
-            # Success! Store credentials in AWS session
+            # Success! Get credentials from assumed role
             credentials = response['Credentials']
+            
+            # Now check if we need to update the CloudFormation stack automatically
+            # This allows the role to update itself when new permissions are added
+            stack_name = f"inversion-deployer-role-{account_id}"
+            template_s3_url = os.environ.get(
+                'CLOUDFORMATION_TEMPLATE_S3_URL',
+                'https://inversion-cloudformation-template.s3.amazonaws.com/templates/cloudformation_template.yaml'
+            )
+            
+            # Create CloudFormation client with assumed role credentials
+            cf_client = boto3.client(
+                'cloudformation',
+                aws_access_key_id=credentials['AccessKeyId'],
+                aws_secret_access_key=credentials['SecretAccessKey'],
+                aws_session_token=credentials['SessionToken'],
+                region_name=region
+            )
+            
+            # Check if stack exists and needs updating
+            print(f"[VERIFY] Checking if CloudFormation stack needs updating...")
+            try:
+                # Get stack details
+                stack_response = cf_client.describe_stacks(StackName=stack_name)
+                stack = stack_response['Stacks'][0]
+                stack_status = stack['StackStatus']
+                print(f"[VERIFY] Stack found. Current status: {stack_status}")
+                
+                # Get current template URL from the stack
+                current_template_url = None
+                try:
+                    template_response = cf_client.get_template(StackName=stack_name)
+                    current_template_url = template_response.get('TemplateURL') or template_response.get('StacksReceivedTemplateUrl')
+                    print(f"[VERIFY] Current template URL: {current_template_url}")
+                except Exception as e:
+                    print(f"[VERIFY] Could not get current template URL: {str(e)}")
+                
+                # Check if we need to update (if template URL is different or stack is in a state that allows updates)
+                can_update = stack_status not in ['UPDATE_ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_FAILED']
+                print(f"[VERIFY] Can update: {can_update} (stack status: {stack_status})")
+                
+                # Handle stuck stack states
+                if stack_status == 'UPDATE_ROLLBACK_FAILED':
+                    print(f"⚠️  Stack is in UPDATE_ROLLBACK_FAILED state - attempting to automatically continue rollback...")
+                    try:
+                        # Automatically continue the rollback
+                        cf_client.continue_update_rollback(StackName=stack_name)
+                        print(f"✅ Rollback continuation initiated. Waiting for completion...")
+                        
+                        # Wait for rollback to complete
+                        max_wait = 300  # 5 minutes
+                        elapsed = 0
+                        rollback_complete = False
+                        while elapsed < max_wait:
+                            time.sleep(5)
+                            elapsed += 5
+                            stack_response = cf_client.describe_stacks(StackName=stack_name)
+                            new_status = stack_response['Stacks'][0]['StackStatus']
+                            if new_status in ['UPDATE_ROLLBACK_COMPLETE', 'UPDATE_COMPLETE', 'CREATE_COMPLETE']:
+                                print(f"✅ Rollback completed. New status: {new_status}")
+                                rollback_complete = True
+                                can_update = True  # Now we can update
+                                stack_status = new_status  # Update for later checks
+                                break
+                            if elapsed % 30 == 0:
+                                print(f"   Waiting for rollback... Status: {new_status} ({elapsed}s)")
+                        
+                        if not rollback_complete:
+                            print(f"⚠️  Rollback did not complete in time. Will still attempt update if possible.")
+                            # Check current status one more time
+                            stack_response = cf_client.describe_stacks(StackName=stack_name)
+                            final_status = stack_response['Stacks'][0]['StackStatus']
+                            if final_status in ['UPDATE_ROLLBACK_COMPLETE', 'UPDATE_COMPLETE', 'CREATE_COMPLETE']:
+                                can_update = True
+                                stack_status = final_status
+                    except ClientError as rollback_error:
+                        error_code = rollback_error.response.get('Error', {}).get('Code', 'Unknown')
+                        error_msg = rollback_error.response.get('Error', {}).get('Message', str(rollback_error))
+                        print(f"❌ Could not automatically continue rollback: {error_code}")
+                        print(f"   Error: {error_msg}")
+                        print(f"   User will need to manually continue rollback in AWS Console.")
+                        print(f"   Stack: {stack_name}")
+                elif stack_status == 'UPDATE_ROLLBACK_COMPLETE':
+                    print(f"⚠️  Stack is in UPDATE_ROLLBACK_COMPLETE state.")
+                    print(f"   Previous update was rolled back. Will attempt update again...")
+                    can_update = True  # Allow update from ROLLBACK_COMPLETE state
+                
+                # Always try to update if we can (the template might have new permissions)
+                # CloudFormation will detect if there are actual changes
+                if can_update and stack_status not in ['UPDATE_IN_PROGRESS', 'CREATE_IN_PROGRESS']:
+                    print(f"[VERIFY] Proceeding with stack update...")
+                    try:
+                        # Get parameters from existing stack
+                        existing_params = {param['ParameterKey']: param['ParameterValue'] for param in stack.get('Parameters', [])}
+                        
+                        # Get Trust ARN and External ID from environment
+                        trust_arn = os.environ.get('TRUST_ARN', '').strip()
+                        if not trust_arn:
+                            service_account_id = os.environ.get('YOUR_AWS_ACCOUNT_ID', '').strip()
+                            if service_account_id:
+                                trust_arn = f"arn:aws:iam::{service_account_id}:root"
+                        
+                        external_id = os.environ.get('EXTERNAL_ID', '').strip()
+                        
+                        # Build update parameters
+                        update_params = [
+                            {'ParameterKey': 'TrustARN', 'ParameterValue': trust_arn}
+                        ]
+                        if external_id:
+                            update_params.append({'ParameterKey': 'ExternalId', 'ParameterValue': external_id})
+                        else:
+                            # If external_id was removed, use existing value or empty
+                            existing_external_id = existing_params.get('ExternalId', '')
+                            update_params.append({'ParameterKey': 'ExternalId', 'ParameterValue': existing_external_id})
+                        
+                        # Update the stack with new template
+                        print(f"Attempting to automatically update CloudFormation stack {stack_name} with latest template...")
+                        cf_client.update_stack(
+                            StackName=stack_name,
+                            TemplateURL=template_s3_url,
+                            Parameters=update_params,
+                            Capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM']  # Required for IAM roles with specific names
+                        )
+                        
+                        # Wait for update to complete (with timeout)
+                        print(f"Stack update initiated, waiting for completion...")
+                        max_wait_time = 300  # 5 minutes max wait
+                        wait_interval = 5
+                        elapsed = 0
+                        
+                        while elapsed < max_wait_time:
+                            time.sleep(wait_interval)
+                            elapsed += wait_interval
+                            
+                            stack_response = cf_client.describe_stacks(StackName=stack_name)
+                            stack = stack_response['Stacks'][0]
+                            stack_status = stack['StackStatus']
+                            
+                            if stack_status in ['UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE', 'UPDATE_ROLLBACK_FAILED']:
+                                break
+                            
+                            if elapsed % 30 == 0:  # Log every 30 seconds
+                                print(f"Stack update in progress... Status: {stack_status} ({elapsed}s)")
+                        
+                        # Get detailed error information if update failed
+                        if stack_status == 'UPDATE_COMPLETE':
+                            print(f"✅ Stack updated successfully!")
+                        elif stack_status == 'UPDATE_ROLLBACK_COMPLETE':
+                            print(f"⚠️  Stack update rolled back (likely no changes detected)")
+                        elif stack_status == 'UPDATE_ROLLBACK_FAILED':
+                            # Get stack events to find the error
+                            try:
+                                events_response = cf_client.describe_stack_events(StackName=stack_name, MaxResults=10)
+                                error_events = [
+                                    e for e in events_response.get('StackEvents', [])
+                                    if e.get('ResourceStatus', '').endswith('FAILED')
+                                ]
+                                if error_events:
+                                    latest_error = error_events[0]
+                                    error_reason = latest_error.get('ResourceStatusReason', 'Unknown error')
+                                    print(f"❌ Stack update failed and rollback also failed!")
+                                    print(f"   Error reason: {error_reason}")
+                                    print(f"   Failed resource: {latest_error.get('LogicalResourceId', 'Unknown')}")
+                                else:
+                                    print(f"❌ Stack update failed with status: {stack_status}")
+                                    print(f"   Stack status reason: {stack.get('StackStatusReason', 'No reason provided')}")
+                            except Exception as e:
+                                print(f"❌ Stack update failed with status: {stack_status}")
+                                print(f"   Could not fetch error details: {str(e)}")
+                        else:
+                            print(f"⚠️  Stack update completed with status: {stack_status}")
+                            if 'StackStatusReason' in stack:
+                                print(f"   Reason: {stack['StackStatusReason']}")
+                    
+                    except ClientError as update_error:
+                        error_code = update_error.response.get('Error', {}).get('Code', 'Unknown')
+                        error_msg = update_error.response.get('Error', {}).get('Message', str(update_error))
+                        # If no updates are needed, CloudFormation returns ValidationError
+                        if error_code == 'ValidationError' and 'No updates' in str(update_error):
+                            print(f"⚠️  Stack update skipped: CloudFormation detected no changes. This usually means:")
+                            print(f"   1. The template in S3 hasn't been updated yet, OR")
+                            print(f"   2. CloudFormation didn't detect the changes (template URL might be cached)")
+                            print(f"   Template URL used: {template_s3_url}")
+                            print(f"   Action: Upload the updated template to S3, then verify connection again.")
+                        else:
+                            print(f"⚠️  Could not automatically update stack: {error_code}")
+                            print(f"   Error message: {error_msg}")
+                            print(f"   Template URL used: {template_s3_url}")
+                            print(f"   User may need to update manually via AWS Console.")
+                            # Continue anyway - the role should still work with current permissions
+                    except Exception as update_error:
+                        print(f"⚠️  Error during automatic stack update: {str(update_error)}. Continuing...")
+                        # Continue anyway - the role should still work with current permissions
+            
+            except ClientError as stack_error:
+                error_code = stack_error.response.get('Error', {}).get('Code', 'Unknown')
+                error_msg = stack_error.response.get('Error', {}).get('Message', str(stack_error))
+                if error_code == 'ValidationError' and 'does not exist' in str(stack_error):
+                    # Stack doesn't exist yet - this is expected for new connections
+                    print(f"[VERIFY] Stack does not exist yet (new connection). Skipping update check.")
+                else:
+                    print(f"⚠️  Could not check/update CloudFormation stack: {error_code}")
+                    print(f"   Error message: {error_msg}")
+                    print(f"   Continuing anyway...")
+            except Exception as stack_error:
+                print(f"⚠️  Error checking CloudFormation stack: {str(stack_error)}")
+                print(f"   Continuing anyway...")
+            
+            # Store credentials in AWS session (after potential stack update)
             session_id = str(uuid.uuid4())
             aws_sessions[session_id] = {
                 'access_key_id': credentials['AccessKeyId'],

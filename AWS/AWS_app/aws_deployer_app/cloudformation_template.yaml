@@ -100,6 +100,22 @@ Resources:
                   - ssm:DescribeInstanceInformation
                 Resource: "*"
 
+              # SSM Session Manager (interactive shell) + data channel permissions
+              # Required for StartSession-based terminal streaming
+              - Sid: SSMSessionManager
+                Effect: Allow
+                Action:
+                  - ssm:StartSession
+                  - ssm:ResumeSession
+                  - ssm:TerminateSession
+                  - ssm:DescribeSessions
+                  - ssm:GetConnectionStatus
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
               # S3 Operations (limited to specific bucket patterns)
               - Sid: S3Operations
                 Effect: Allow
@@ -200,6 +216,19 @@ Resources:
                   - logs:DescribeLogStreams
                   - logs:DescribeLogGroups
                 Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/codebuild/*"
+
+              # CloudFormation Operations (for automatic stack updates)
+              # Allows the role to update its own CloudFormation stack
+              - Sid: CloudFormationUpdateStack
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:GetTemplate
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ContinueUpdateRollback
+                Resource: !Sub "arn:aws:cloudformation:*:${AWS::AccountId}:stack/inversion-deployer-role-${AWS::AccountId}/*"
 
 Conditions:
   HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]

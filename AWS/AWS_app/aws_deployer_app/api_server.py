@@ -55,6 +55,11 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(docker_router)
 app.include_router(file_transfer_router)
+try:
+    from terminal_routes import router as terminal_router
+    app.include_router(terminal_router)
+except ImportError:
+    print("Warning: terminal_routes not available (websockets dependency may be missing)")
 
 
 # ------------------------------------------------------------------------------

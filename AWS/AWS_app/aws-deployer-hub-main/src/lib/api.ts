@@ -678,3 +678,58 @@ export async function executeCommand(
   return response.json();
 }
 
+/**
+ * Generate AWS Console Session Manager deep link URL.
+ * Opens the AWS Console Session Manager page for the specified instance.
+ * 
+ * @param region AWS region (e.g., "us-east-1")
+ * @param instanceId EC2 instance ID (e.g., "i-1234567890abcdef0")
+ * @returns AWS Console URL that opens Session Manager for the instance
+ */
+export function getAwsConsoleSessionManagerUrl(region: string, instanceId: string) {
+  return `https://${region}.console.aws.amazon.com/systems-manager/session-manager?region=${region}#/session-manager/instances/${instanceId}`;
+}
+
+/**
+ * Open AWS Console Session Manager in a new tab.
+ * This uses the AWS Console's built-in one-click browser-based shell.
+ * 
+ * Requirements:
+ * - User must be logged into AWS Console
+ * - User must have ssm:StartSession permission
+ * - Instance must have AmazonSSMManagedInstanceCore policy attached
+ * - SSM Agent must be running on the instance
+ * 
+ * @param region AWS region
+ * @param instanceId EC2 instance ID
+ */
+export function openAwsConsoleTerminal(region: string, instanceId: string): void {
+  const url = getAwsConsoleSessionManagerUrl(region, instanceId);
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+// Deprecated: Keeping for backwards compatibility, but not used anymore
+export interface TerminalStartResponse {
+  terminal_session_id: string;
+  aws_session_id: string;
+  message: string;
+}
+
+// Deprecated: Use openAwsConsoleTerminal() instead
+export function startTerminalSession(region: string, instanceId: string): Promise<TerminalStartResponse> {
+  const sessionId = getSessionId();
+  const headers: HeadersInit = { "Content-Type": "application/json" };
+  
+  if (sessionId) {
+    headers["X-Session-ID"] = sessionId;
+  }
+
+  return apiFetch<TerminalStartResponse>("/terminal/start", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      region,
+      instance_id: instanceId,
+    }),
+  });
+}

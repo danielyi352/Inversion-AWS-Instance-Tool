@@ -2,8 +2,6 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 pydantic>=2.9.0
-pydantic[email]>=2.9.0  # Includes email-validator for EmailStr validation
-email-validator>=2.0.0  # Explicit dependency for EmailStr field validation
 python-multipart>=0.0.6
 
 # AWS SDK
@@ -24,3 +22,6 @@ pymongo>=4.6.0
 google-auth>=2.23.0
 google-auth-oauthlib>=1.1.0
 google-auth-httplib2>=0.1.1
+
+# WebSocket client (for SSM Session Manager data channel proxying)
+websockets>=12.0

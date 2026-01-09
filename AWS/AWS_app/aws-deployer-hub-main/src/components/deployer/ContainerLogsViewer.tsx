@@ -1,7 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { 
   FileText, 
@@ -10,11 +9,11 @@ import {
   Loader2,
   Play,
   Square,
-  Terminal,
-  Send
+  Terminal
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { getContainerLogs, downloadContainerLogs, executeCommand, type ContainerLogsResponse } from '@/lib/api';
+import { getContainerLogs, downloadContainerLogs, type ContainerLogsResponse, openAwsConsoleTerminal } from '@/lib/api';
+// Removed xterm.js imports - using AWS Console Session Manager instead
 
 interface ContainerLogsViewerProps {
   instanceId: string;
@@ -39,12 +38,7 @@ export function ContainerLogsViewer({
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [refreshInterval, setRefreshInterval] = useState<NodeJS.Timeout | null>(null);
   
-  // Terminal state
-  const [command, setCommand] = useState('');
-  const [terminalOutput, setTerminalOutput] = useState<string[]>([]);
-  const [executing, setExecuting] = useState(false);
-  const [executeOnHost, setExecuteOnHost] = useState(false);
-  const terminalEndRef = useRef<HTMLDivElement>(null);
+  // Removed command execution state - using AWS Console Session Manager instead
 
   const loadLogs = async () => {
     if (!instanceId) {
@@ -170,72 +164,32 @@ export function ContainerLogsViewer({
     setAutoRefresh(!autoRefresh);
   };
 
-  // Terminal functions
-  const executeTerminalCommand = async () => {
-    if (!command.trim() || executing) {
+  // Removed command execution functions - using AWS Console Session Manager instead
+
+  // Open AWS Console Session Manager terminal
+  const openTerminal = () => {
+    if (!instanceId) {
+      toast.error('No instance selected');
       return;
     }
-
-    setExecuting(true);
-    const commandToExecute = command.trim();
-    setCommand(''); // Clear input
     
-    // Add command to output
-    const prompt = executeOnHost ? '[host]' : (containerName ? `[${containerName}]` : '[host]');
-    setTerminalOutput(prev => [...prev, `$ ${prompt} ${commandToExecute}`]);
-
     try {
-      const result = await executeCommand(
-        region,
-        instanceId,
-        commandToExecute,
-        containerName,
-        repository,
-        accountId,
-        executeOnHost
-      );
-
-      // Add output to terminal
-      if (result.combined) {
-        setTerminalOutput(prev => [...prev, result.combined]);
-      } else if (result.stdout) {
-        setTerminalOutput(prev => [...prev, result.stdout]);
-      }
-      
-      if (result.stderr && result.stderr !== result.stdout) {
-        setTerminalOutput(prev => [...prev, `[stderr] ${result.stderr}`]);
-      }
-
-      // Scroll to bottom
-      setTimeout(() => {
-        terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-      }, 100);
+      openAwsConsoleTerminal(region, instanceId);
+      toast.success('Opening AWS Console Session Manager...', {
+        description: 'Make sure you are logged into AWS Console and have ssm:StartSession permission.',
+      });
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to execute command';
-      setTerminalOutput(prev => [...prev, `[error] ${errorMessage}`]);
-      toast.error(`Command failed: ${errorMessage}`);
-    } finally {
-      setExecuting(false);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to open terminal';
+      toast.error(`Terminal error: ${errorMessage}`);
     }
   };
 
-  const handleTerminalKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      executeTerminalCommand();
-    }
-  };
-
-  const clearTerminal = () => {
-    setTerminalOutput([]);
-  };
-
-  // Auto-scroll terminal output
+  // Cleanup on unmount
   useEffect(() => {
-    if (terminalOutput.length > 0) {
-      terminalEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [terminalOutput]);
+    return () => {
+      disconnectTerminal();
+    };
+  }, []);
 
   return (
     <Card className="border-border/60 shadow-sm">
@@ -355,80 +309,37 @@ export function ContainerLogsViewer({
           </TabsContent>
 
           <TabsContent value="terminal" className="space-y-4 mt-4">
-            {/* Terminal Output */}
-            <div className="border border-border/60 rounded-md bg-black text-green-400 font-mono text-xs p-4 min-h-[300px] max-h-[600px] overflow-y-auto">
-              {terminalOutput.length === 0 ? (
-                <div className="flex items-center justify-center py-12">
-                  <span className="text-muted-foreground">Terminal ready. Type a command and press Enter.</span>
+            {/* AWS Console Session Manager Terminal */}
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-medium mb-1">AWS Console Session Manager</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Open an interactive terminal session in AWS Console. No plugins or CLI required.
+                  </p>
                 </div>
-              ) : (
-                <div className="space-y-1">
-                  {terminalOutput.map((line, index) => (
-                    <div key={index} className="whitespace-pre-wrap break-words">
-                      {line}
-                    </div>
-                  ))}
-                  <div ref={terminalEndRef} />
-                </div>
-              )}
-            </div>
-
-            {/* Command Input */}
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <Input
-                  value={command}
-                  onChange={(e) => setCommand(e.target.value)}
-                  onKeyPress={handleTerminalKeyPress}
-                  placeholder={executeOnHost ? "Execute command on host..." : (containerName ? `Execute command in ${containerName}...` : "Execute command on host...")}
-                  disabled={executing}
-                  className="font-mono text-sm"
-                />
                 <Button
-                  onClick={executeTerminalCommand}
-                  disabled={executing || !command.trim()}
+                  onClick={openTerminal}
                   size="sm"
                   className="gap-2"
                 >
-                  {executing ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Send className="h-4 w-4" />
-                  )}
-                  Execute
-                </Button>
-                <Button
-                  variant="outline"
-                  onClick={clearTerminal}
-                  disabled={terminalOutput.length === 0}
-                  size="sm"
-                >
-                  Clear
+                  <Terminal className="h-4 w-4" />
+                  Open Terminal in AWS Console
                 </Button>
               </div>
-              {containerName && (
-                <div className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    id="executeOnHost"
-                    checked={executeOnHost}
-                    onChange={(e) => setExecuteOnHost(e.target.checked)}
-                    className="rounded border-border"
-                  />
-                  <label htmlFor="executeOnHost" className="text-xs text-muted-foreground cursor-pointer">
-                    Execute on host (instead of container)
-                  </label>
-                </div>
-              )}
-            </div>
 
-            {/* Info */}
-            <div className="text-xs text-muted-foreground">
-              {executeOnHost 
-                ? 'Commands will execute on the EC2 host instance'
-                : (containerName 
-                  ? `Commands will execute inside container: ${containerName}`
-                  : 'Commands will execute on the EC2 host instance')}
+              <div className="border border-border/60 rounded-md p-4 bg-muted/50">
+                <div className="space-y-2 text-sm">
+                  <p className="font-medium">Requirements:</p>
+                  <ul className="list-disc list-inside space-y-1 text-muted-foreground">
+                    <li>You must be logged into AWS Console</li>
+                    <li>Your IAM user/role needs <code className="bg-background px-1 rounded">ssm:StartSession</code> permission</li>
+                    <li>Instance must have <code className="bg-background px-1 rounded">AmazonSSMManagedInstanceCore</code> policy attached</li>
+                    <li>SSM Agent must be running on the instance</li>
+                  </ul>
+                </div>
+              </div>
+
             </div>
           </TabsContent>
         </Tabs>
