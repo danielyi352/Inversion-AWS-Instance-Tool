@@ -64,12 +64,47 @@ except ImportError:
 
 
 # ------------------------------------------------------------------------------
+# Frontend build detection (must be before routes that use it)
+# ------------------------------------------------------------------------------
+
+# Try to mount static files if the frontend build directory exists
+# This allows the backend to serve the frontend in production
+frontend_build_paths = [
+    os.path.join(os.path.dirname(__file__), "..", "aws-deployer-hub-main", "dist"),
+    os.path.join(os.path.dirname(__file__), "..", "..", "aws-deployer-hub-main", "dist"),
+    os.path.join(os.path.dirname(__file__), "dist"),
+]
+
+frontend_dist_path = None
+for path in frontend_build_paths:
+    abs_path = os.path.abspath(path)
+    if os.path.exists(abs_path) and os.path.isdir(abs_path):
+        frontend_dist_path = abs_path
+        break
+
+if frontend_dist_path:
+    print(f"[INFO] Frontend build found at: {frontend_dist_path}")
+    # Mount static files (JS, CSS, images, etc.)
+    assets_dir = os.path.join(frontend_dist_path, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+        print(f"[INFO] Static assets mounted from: {assets_dir}")
+
+
+# ------------------------------------------------------------------------------
 # Root and Health Check Endpoints
 # ------------------------------------------------------------------------------
 
 @app.get("/")
 def root():
-    """Root endpoint - returns API information."""
+    """Root endpoint - serve frontend if available, otherwise return API information."""
+    # Check if frontend is available and serve it
+    if frontend_dist_path:
+        index_path = os.path.join(frontend_dist_path, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+    
+    # Fallback to API info if frontend not available
     return {
         "name": "Inversion Deployer API",
         "version": "1.0.0",
@@ -1741,35 +1776,21 @@ def connect(request: Request, body: ConnectRequest):
 
 
 # ------------------------------------------------------------------------------
-# Static file serving for frontend (SPA support)
+# Static file serving for frontend (SPA catch-all route)
 # ------------------------------------------------------------------------------
 
-# Try to mount static files if the frontend build directory exists
-# This allows the backend to serve the frontend in production
-frontend_build_paths = [
-    os.path.join(os.path.dirname(__file__), "..", "aws-deployer-hub-main", "dist"),
-    os.path.join(os.path.dirname(__file__), "..", "..", "aws-deployer-hub-main", "dist"),
-    os.path.join(os.path.dirname(__file__), "dist"),
-]
-
-frontend_dist_path = None
-for path in frontend_build_paths:
-    abs_path = os.path.abspath(path)
-    if os.path.exists(abs_path) and os.path.isdir(abs_path):
-        frontend_dist_path = abs_path
-        break
+# Set up SPA catch-all AFTER all other routes are defined
+# This ensures the catch-all is truly the last route and catches all unmatched paths
 
 if frontend_dist_path:
-    # Mount static files (JS, CSS, images, etc.) - must be mounted before catch-all route
-    assets_dir = os.path.join(frontend_dist_path, "assets")
-    if os.path.exists(assets_dir):
-        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
-    
     # Serve index.html for all non-API routes (SPA catch-all)
     # This must be the last route to catch all unmatched paths
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str, request: Request):
         """Serve index.html for all non-API routes to support client-side routing."""
+        # Debug logging
+        print(f"[DEBUG] SPA catch-all route hit: full_path='{full_path}', url='{request.url.path}'")
+        
         # Don't serve index.html for API routes or special endpoints
         # full_path doesn't include leading slash, so "api/metadata" not "/api/metadata"
         if (full_path.startswith("api/") or 
@@ -1778,15 +1799,19 @@ if frontend_dist_path:
             full_path.startswith("openapi.json") or 
             full_path == "health" or
             full_path.startswith("assets/")):
+            print(f"[DEBUG] Rejecting API/special route: {full_path}")
             raise HTTPException(status_code=404, detail="Not found")
         
-        # Serve index.html for all other routes (including root "/" which gives empty string)
+        # Serve index.html for all other routes (including empty string for root)
         index_path = os.path.join(frontend_dist_path, "index.html")
         if os.path.exists(index_path):
+            print(f"[DEBUG] Serving index.html for route: {full_path}")
             return FileResponse(index_path)
         else:
+            print(f"[ERROR] index.html not found at: {index_path}")
             raise HTTPException(status_code=404, detail="Frontend not found. Please build the frontend first.")
 else:
+    print(f"[WARNING] Frontend build not found. Checked paths: {frontend_build_paths}")
     # Frontend build not found - add a catch-all that returns a helpful message
     # This must be the last route to catch all unmatched paths
     @app.get("/{full_path:path}")
@@ -1804,6 +1829,6 @@ else:
         return {
             "message": "Frontend build not found",
             "detail": "The frontend static files are not available. In production, ensure the frontend is built and the dist directory is accessible.",
-            "paths_checked": frontend_build_paths
+            "paths_checked": [str(p) for p in frontend_build_paths]
         }
 
