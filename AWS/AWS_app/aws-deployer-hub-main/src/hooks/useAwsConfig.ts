@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import type { AwsConfig, RunningInstance, LogEntry, TransferStatus, AwsMetadata } from '@/types/aws';
 import { assumeRoleLogin, checkRepositoryStatus, connect, deployStream, downloadFile, fetchInstances, fetchMetadata, loginSso, terminate, uploadFile } from '@/lib/api';
 import { toast } from 'sonner';
@@ -20,6 +21,7 @@ const defaultConfig: AwsConfig = {
 };
 
 export function useAwsConfig() {
+  const navigate = useNavigate();
   const [config, setConfig] = useState<AwsConfig>(defaultConfig);
   const [rememberSettings, setRememberSettings] = useState(true);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -417,8 +419,8 @@ export function useAwsConfig() {
     setMetadata({ repositories: [], securityGroups: [] });
     setRepositoryStatus(null);
     
-    // Redirect to login page
-    window.location.href = '/login';
+    // Redirect to login page using React Router
+    navigate('/login', { replace: true });
     setProgress(0);
     
     addLog('Logged out successfully', 'info');
