@@ -411,15 +411,9 @@ async def cloudformation_verify(body: CloudFormationVerifyRequest, request: Requ
         )
     
     # Verify user is a member of the organization
-    from org_helpers import verify_org_membership, can_manage_aws_connections
+    # Members can verify connections, but only ADMIN/OWNER can create new ones
+    from org_helpers import verify_org_membership
     membership = await verify_org_membership(user_id, org_id)
-    
-    # Check if user can manage AWS connections (ADMIN or OWNER)
-    if not await can_manage_aws_connections(user_id, org_id):
-        raise HTTPException(
-            status_code=403,
-            detail="You must be an ADMIN or OWNER to connect AWS accounts to this organization"
-        )
     
     # Check if this org already has this AWS account
     db = await connect_to_mongodb()
@@ -885,15 +879,9 @@ async def assume_role_login(body: AssumeRoleRequest, request: Request):
             body.role_arn = f"arn:aws:iam::{account_id}:role/InversionDeployerRole"
         
         # Verify user is a member of the organization
-        from org_helpers import verify_org_membership, can_manage_aws_connections
+        # Members can assume roles and use AWS connections
+        from org_helpers import verify_org_membership
         membership = await verify_org_membership(user_id, org_id)
-        
-        # Check if user can manage AWS connections (ADMIN or OWNER)
-        if not await can_manage_aws_connections(user_id, org_id):
-            raise HTTPException(
-                status_code=403,
-                detail="You must be an ADMIN or OWNER to connect AWS accounts to this organization"
-            )
         
         # Check if this org already has this AWS account
         db = await connect_to_mongodb()
