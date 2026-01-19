@@ -184,13 +184,6 @@ export function ContainerLogsViewer({
     }
   };
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      disconnectTerminal();
-    };
-  }, []);
-
   return (
     <Card className="border-border/60 shadow-sm">
       <CardHeader className="pb-4">
