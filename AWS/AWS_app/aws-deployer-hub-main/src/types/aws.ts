@@ -64,6 +64,7 @@ export interface AssumeRoleLoginRequest {
   accountId: string;
   externalId?: string;
   region: string;
+  orgId: string;
 }
 
 export interface AssumeRoleLoginResponse {

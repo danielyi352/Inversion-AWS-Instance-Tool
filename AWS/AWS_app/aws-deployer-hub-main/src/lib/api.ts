@@ -28,14 +28,26 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     headers["X-User-Session-ID"] = userSessionId;
   }
   
+  // Merge with any existing headers from options
+  const mergedHeaders = {
+    ...headers,
+    ...(options?.headers || {}),
+  };
+  
   try {
     const res = await fetch(`${API_BASE}${path}`, {
-      headers,
       ...options,
+      headers: mergedHeaders,
     });
     
     if (!res.ok) {
-      const detail = await res.text();
+      let detail: string;
+      try {
+        const errorData = await res.json();
+        detail = errorData.detail || errorData.message || JSON.stringify(errorData);
+      } catch {
+        detail = await res.text() || res.statusText;
+      }
       
       // Check for session expiration (401 status or session-related errors)
       if (res.status === 401 || detail.includes('Invalid or expired session') || detail.includes('Session expired')) {
@@ -146,7 +158,7 @@ export function logout() {
   });
 }
 
-export function cloudformationLogin(accountId: string, region: string) {
+export function cloudformationLogin(accountId: string, region: string, orgId: string) {
   return apiFetch<{
     status: string;
     account_id: string;
@@ -161,11 +173,12 @@ export function cloudformationLogin(accountId: string, region: string) {
     body: JSON.stringify({
       account_id: accountId,
       region: region,
+      org_id: orgId,
     }),
   });
 }
 
-export function cloudformationVerify(accountId: string, region: string) {
+export function cloudformationVerify(accountId: string, region: string, orgId: string) {
   return apiFetch<{
     status: string;
     session_id: string;
@@ -179,6 +192,7 @@ export function cloudformationVerify(accountId: string, region: string) {
     body: JSON.stringify({
       account_id: accountId,
       region: region,
+      org_id: orgId,
     }),
   });
 }
@@ -191,6 +205,7 @@ export function assumeRoleLogin(request: AssumeRoleLoginRequest) {
       account_id: request.accountId,
       external_id: request.externalId,
       region: request.region,
+      org_id: request.orgId,
     }),
   });
 }
@@ -731,5 +746,133 @@ export function startTerminalSession(region: string, instanceId: string): Promis
       region,
       instance_id: instanceId,
     }),
+  });
+}
+
+// ============================================================================
+// Organization API Functions
+// ============================================================================
+
+export interface CreateOrgRequest {
+  name: string;
+  slug?: string;
+  description?: string;
+}
+
+export interface Organization {
+  org_id: string;
+  name: string;
+  slug?: string;
+  owner_id: string;
+  description?: string;
+  default_aws_account_id?: string;
+  created_at: string;
+  updated_at: string;
+  role?: string; // When returned from list endpoint
+}
+
+export interface UpdateOrgRequest {
+  name?: string;
+  description?: string;
+  default_aws_account_id?: string;
+}
+
+export interface OrganizationMember {
+  user_id: string;
+  email: string;
+  name?: string;
+  role: string;
+  joined_at: string;
+}
+
+export interface InviteUserRequest {
+  email: string;
+  role: 'owner' | 'admin' | 'member';
+}
+
+export function createOrganization(data: CreateOrgRequest) {
+  return apiFetch<{ status: string; organization: Organization; message: string }>("/orgs/create", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export function listOrganizations() {
+  return apiFetch<{ status: string; organizations: Organization[] }>("/orgs", {
+    method: "GET",
+  });
+}
+
+export function getOrganization(orgId: string) {
+  return apiFetch<{ status: string; organization: Organization; member_count: number; aws_connection_count: number }>(`/orgs/${orgId}`, {
+    method: "GET",
+  });
+}
+
+export function updateOrganization(orgId: string, data: UpdateOrgRequest) {
+  return apiFetch<{ status: string; organization: Organization; message: string }>(`/orgs/${orgId}`, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
+export function inviteUser(orgId: string, data: InviteUserRequest) {
+  return apiFetch<{ status: string; invitation: any; message: string }>(`/orgs/${orgId}/invite`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export function listOrgMembers(orgId: string) {
+  return apiFetch<{ status: string; members: OrganizationMember[] }>(`/orgs/${orgId}/members`, {
+    method: "GET",
+  });
+}
+
+export function listInvitations() {
+  return apiFetch<{ status: string; invitations: any[] }>("/orgs/invitations", {
+    method: "GET",
+  });
+}
+
+export function acceptInvitation(token: string) {
+  return apiFetch<{ status: string; message: string }>(`/orgs/invitations/${token}/accept`, {
+    method: "POST",
+  });
+}
+
+export function rejectInvitation(token: string) {
+  return apiFetch<{ status: string; message: string }>(`/orgs/invitations/${token}/reject`, {
+    method: "POST",
+  });
+}
+
+export function leaveOrganization(orgId: string) {
+  return apiFetch<{ status: string; message: string }>(`/orgs/${orgId}/leave`, {
+    method: "POST",
+  });
+}
+
+export function updateMemberRole(orgId: string, userId: string, role: 'admin' | 'member') {
+  return apiFetch<{ status: string; message: string }>(`/orgs/${orgId}/members/${userId}/role`, {
+    method: "PUT",
+    body: JSON.stringify({ user_id: userId, role }),
+  });
+}
+
+export function removeMember(orgId: string, userId: string) {
+  return apiFetch<{ status: string; message: string }>(`/orgs/${orgId}/members/${userId}`, {
+    method: "DELETE",
+  });
+}
+
+export function deleteOrganization(orgId: string) {
+  const userSessionId = getUserSessionId();
+  if (!userSessionId) {
+    return Promise.reject(new Error("Not authenticated"));
+  }
+  
+  return apiFetch<{ status: string; message: string }>(`/orgs/${orgId}`, {
+    method: "DELETE",
   });
 }

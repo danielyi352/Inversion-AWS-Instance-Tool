@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -238,6 +238,7 @@ def session_from_credentials(credentials: Dict[str, Any], region: str):
 class CloudFormationLoginRequest(BaseModel):
     account_id: str = Field(..., description="AWS Account ID")
     region: str = Field(default="us-east-1", description="AWS Region")
+    org_id: str = Field(..., description="Organization ID to connect this AWS account to")
 
 
 class AssumeRoleRequest(BaseModel):
@@ -245,11 +246,13 @@ class AssumeRoleRequest(BaseModel):
     account_id: str = Field(..., description="AWS Account ID")
     region: str = Field(default="us-east-1")
     external_id: Optional[str] = Field(None, description="External ID for security (optional)")
+    org_id: str = Field(..., description="Organization ID to connect this AWS account to")
 
 
 class CloudFormationVerifyRequest(BaseModel):
     account_id: str = Field(..., description="AWS Account ID")
     region: str = Field(default="us-east-1", description="AWS Region")
+    org_id: str = Field(..., description="Organization ID to connect this AWS account to")
 
 
 class LoginRequest(BaseModel):
@@ -375,12 +378,20 @@ async def cloudformation_verify(body: CloudFormationVerifyRequest, request: Requ
     """
     Automatically verify and connect to the customer's AWS account after stack creation.
     Computes the role ARN and attempts to assume it with retries.
-    Stores the AWS account connection in the database with uniqueness constraint.
+    Stores the AWS account connection in the database linked to an organization.
     """
     import time
     
     account_id = body.account_id.strip()
     region = body.region
+    org_id = body.org_id
+    
+    # Check if organization has a default AWS account ID set
+    from org_helpers import get_organization
+    org = await get_organization(org_id)
+    if org.default_aws_account_id:
+        # Use organization's default AWS account ID instead of the provided one
+        account_id = org.default_aws_account_id.strip()
     
     # Validate account ID format (12 digits)
     if not account_id.isdigit() or len(account_id) != 12:
@@ -399,26 +410,24 @@ async def cloudformation_verify(body: CloudFormationVerifyRequest, request: Requ
             detail="You must be logged in to connect an AWS account. Please login first."
         )
     
-    # Check if this AWS account ID is already associated with another user
-    db = await connect_to_mongodb()
-    users_collection = db.users
-    connections_collection = db.aws_connections
+    # Verify user is a member of the organization
+    from org_helpers import verify_org_membership, can_manage_aws_connections
+    membership = await verify_org_membership(user_id, org_id)
     
-    # Check if another user has this AWS account ID
-    other_user = await users_collection.find_one({
-        "aws_account_id": account_id,
-        "user_id": {"$ne": user_id}  # Not the current user
-    })
-    
-    if other_user:
-        # Block connection - AWS account ID is already associated with another user
+    # Check if user can manage AWS connections (ADMIN or OWNER)
+    if not await can_manage_aws_connections(user_id, org_id):
         raise HTTPException(
-            status_code=409,
-            detail="This AWS account is already associated with another user account. Please use a different AWS account ID."
+            status_code=403,
+            detail="You must be an ADMIN or OWNER to connect AWS accounts to this organization"
         )
     
-    # Check if current user already has this AWS account ID
-    user_has_account = current_user.aws_account_id == account_id
+    # Check if this org already has this AWS account
+    db = await connect_to_mongodb()
+    connections_collection = db.aws_connections
+    org_has_account = await connections_collection.find_one({
+        "org_id": org_id,
+        "aws_account_id": account_id
+    })
     
     # Compute role ARN (role name is fixed: InversionDeployerRole)
     role_arn = f"arn:aws:iam::{account_id}:role/InversionDeployerRole"
@@ -689,25 +698,16 @@ async def cloudformation_verify(body: CloudFormationVerifyRequest, request: Requ
                 'region': region,
                 'role_arn': role_arn,
                 'account_id': account_id,
+                'org_id': org_id,  # Include org_id in session
             }
-            
-            # Associate AWS account ID with user account
-            await users_collection.update_one(
-                {"user_id": user_id},
-                {
-                    "$set": {
-                        "aws_account_id": account_id,
-                        "updated_at": datetime.now(timezone.utc)
-                    }
-                }
-            )
             
             # Generate a new external ID for this connection
             new_external_id = str(uuid.uuid4())
             
-            # Store or update AWS connection in database
+            # Store or update AWS connection in database (org-based)
             connection_data = {
-                'user_id': user_id,
+                'org_id': org_id,
+                'created_by': user_id,
                 'aws_account_id': account_id,
                 'role_arn': role_arn,
                 'region': region,
@@ -718,16 +718,16 @@ async def cloudformation_verify(body: CloudFormationVerifyRequest, request: Requ
                 'last_used_at': datetime.now(timezone.utc),
             }
             
-            # Check if connection already exists for this user
-            existing_user_connection = await connections_collection.find_one({
-                "user_id": user_id,
+            # Check if connection already exists for this org
+            existing_org_connection = await connections_collection.find_one({
+                "org_id": org_id,
                 "aws_account_id": account_id
             })
             
-            if existing_user_connection:
+            if existing_org_connection:
                 # Update existing connection
                 await connections_collection.update_one(
-                    {"_id": existing_user_connection["_id"]},
+                    {"_id": existing_org_connection["_id"]},
                     {"$set": connection_data}
                 )
             else:
@@ -873,24 +873,32 @@ async def assume_role_login(body: AssumeRoleRequest, request: Request):
         
         # Extract account ID from role ARN or use provided one
         account_id = body.account_id or body.role_arn.split(':')[4]
+        org_id = body.org_id
         
-        # Check if this AWS account ID is already associated with another user
+        # Check if organization has a default AWS account ID set
+        from org_helpers import get_organization
+        org = await get_organization(org_id)
+        if org.default_aws_account_id:
+            # Use organization's default AWS account ID instead of the provided one
+            account_id = org.default_aws_account_id.strip()
+            # Update role ARN to match the organization's AWS account
+            body.role_arn = f"arn:aws:iam::{account_id}:role/InversionDeployerRole"
+        
+        # Verify user is a member of the organization
+        from org_helpers import verify_org_membership, can_manage_aws_connections
+        membership = await verify_org_membership(user_id, org_id)
+        
+        # Check if user can manage AWS connections (ADMIN or OWNER)
+        if not await can_manage_aws_connections(user_id, org_id):
+            raise HTTPException(
+                status_code=403,
+                detail="You must be an ADMIN or OWNER to connect AWS accounts to this organization"
+            )
+        
+        # Check if this org already has this AWS account
         db = await connect_to_mongodb()
-        users_collection = db.users
         connections_collection = db.aws_connections
         
-        # Check if another user has this AWS account ID
-        other_user = await users_collection.find_one({
-            "aws_account_id": account_id,
-            "user_id": {"$ne": user_id}  # Not the current user
-        })
-        
-        if other_user:
-            # Block connection - AWS account ID is already associated with another user
-            raise HTTPException(
-                status_code=409,
-                detail="This AWS account is already associated with another user account. Please use a different AWS account ID."
-            )
         # Get your AWS credentials (for assuming the role)
         your_access_key, your_secret_key = _get_your_aws_credentials()
         
@@ -928,25 +936,16 @@ async def assume_role_login(body: AssumeRoleRequest, request: Request):
             'region': body.region,
             'role_arn': body.role_arn,
             'account_id': account_id,
+            'org_id': org_id,  # Include org_id in session
         }
-        
-        # Associate AWS account ID with user account
-        await users_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "aws_account_id": account_id,
-                    "updated_at": datetime.now(timezone.utc)
-                }
-            }
-        )
         
         # Generate a new external ID for this connection
         new_external_id = str(uuid.uuid4())
         
-        # Store or update AWS connection in database
+        # Store or update AWS connection in database (org-based)
         connection_data = {
-            'user_id': user_id,
+            'org_id': org_id,
+            'created_by': user_id,
             'aws_account_id': account_id,
             'role_arn': body.role_arn,
             'region': body.region,
@@ -957,16 +956,16 @@ async def assume_role_login(body: AssumeRoleRequest, request: Request):
             'last_used_at': datetime.now(timezone.utc),
         }
         
-        # Check if connection already exists for this user
-        existing_user_connection = await connections_collection.find_one({
-            "user_id": user_id,
+        # Check if connection already exists for this org
+        existing_org_connection = await connections_collection.find_one({
+            "org_id": org_id,
             "aws_account_id": account_id
         })
         
-        if existing_user_connection:
+        if existing_org_connection:
             # Update existing connection
             await connections_collection.update_one(
-                {"_id": existing_user_connection["_id"]},
+                {"_id": existing_org_connection["_id"]},
                 {"$set": connection_data}
             )
         else:
@@ -1182,10 +1181,10 @@ async def logout(request: Request):
 
 
 @router.get("/auth/check-aws-account/{account_id}")
-async def check_aws_account(request: Request, account_id: str):
+async def check_aws_account(request: Request, account_id: str, org_id: Optional[str] = Query(None)):
     """
-    Check if an AWS account ID is already associated with another user.
-    Returns information about who owns it (if anyone).
+    Check if an AWS account ID is already connected to an organization.
+    Returns information about which organizations have it connected (if any).
     """
     try:
         current_user = await get_current_user(request)
@@ -1204,34 +1203,45 @@ async def check_aws_account(request: Request, account_id: str):
         )
     
     db = await connect_to_mongodb()
-    users_collection = db.users
+    connections_collection = db.aws_connections
     
-    # Check if another user has this AWS account ID
-    other_user = await users_collection.find_one({
-        "aws_account_id": account_id,
-        "user_id": {"$ne": user_id}  # Not the current user
-    })
+    # Check which organizations have this AWS account connected
+    connections = await connections_collection.find({
+        "aws_account_id": account_id
+    }).to_list(length=100)
     
-    if other_user:
-        return {
-            "account_id": account_id,
-            "is_associated": True,
-            "associated_with_other_user": True,
-            "message": "This AWS account is already associated with another user account."
-        }
-    elif current_user.aws_account_id == account_id:
-        return {
-            "account_id": account_id,
-            "is_associated": True,
-            "associated_with_other_user": False,
-            "associated_with_current_user": True,
-            "message": "This AWS account is already associated with your account"
-        }
+    if connections:
+        org_ids = [conn.get("org_id") for conn in connections if conn.get("org_id")]
+        
+        # If org_id provided, check if this org already has it
+        if org_id:
+            if org_id in org_ids:
+                return {
+                    "account_id": account_id,
+                    "is_associated": True,
+                    "associated_with_current_org": True,
+                    "message": "This AWS account is already connected to this organization."
+                }
+            else:
+                return {
+                    "account_id": account_id,
+                    "is_associated": True,
+                    "associated_with_current_org": False,
+                    "associated_with_other_orgs": True,
+                    "org_count": len(org_ids),
+                    "message": f"This AWS account is connected to {len(org_ids)} other organization(s)."
+                }
+        else:
+            return {
+                "account_id": account_id,
+                "is_associated": True,
+                "org_count": len(org_ids),
+                "message": f"This AWS account is connected to {len(org_ids)} organization(s)."
+            }
     else:
         return {
             "account_id": account_id,
             "is_associated": False,
-            "associated_with_other_user": False,
-            "message": "This AWS account is not associated with any user"
+            "message": "This AWS account is not connected to any organization"
         }
 

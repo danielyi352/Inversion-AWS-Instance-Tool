@@ -48,6 +48,21 @@ class AWSConnectionStatus(str, Enum):
     EXPIRED_PENDING = "expired_pending"
 
 
+class OrganizationRole(str, Enum):
+    """Roles within an organization."""
+    OWNER = "owner"      # Can manage org, invite users, delete org
+    ADMIN = "admin"      # Can manage AWS connections, invite users
+    MEMBER = "member"    # Can use AWS connections
+
+
+class InvitationStatus(str, Enum):
+    """Status of organization invitations."""
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
 # ============================================================================
 # User Model
 # ============================================================================
@@ -69,11 +84,13 @@ class User(BaseModel):
     auth_provider: str = Field(..., description="Auth provider: 'email', 'google', etc.")
     auth_provider_id: Optional[str] = Field(None, description="Provider-specific user ID")
     
-    # Organization/Team support (for future)
-    org_id: Optional[str] = Field(None, description="Organization ID (if part of an org)")
+    # Organization/Team support
+    # Note: Users can belong to multiple orgs, this is just for UI convenience (primary org)
+    org_id: Optional[str] = Field(None, description="Primary organization ID (for UI convenience)")
     
-    # AWS Account Association
-    aws_account_id: Optional[str] = Field(None, description="Associated AWS Account ID (12 digits)")
+    # AWS Account Association (DEPRECATED - use Organization AWS connections instead)
+    # Keeping for backward compatibility during migration
+    aws_account_id: Optional[str] = Field(None, description="[DEPRECATED] Associated AWS Account ID (12 digits)")
     
     # Timestamps
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -103,14 +120,18 @@ class User(BaseModel):
 
 class AWSConnection(BaseModel):
     """
-    AWS account connection model.
+    AWS account connection model - now organization-based.
     
-    Represents a connection between a user and an AWS account.
+    Represents a connection between an organization and an AWS account.
+    All members of the organization can use this connection.
     Uses a "claiming" flow to verify ownership before activation.
     """
     id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
-    user_id: str = Field(..., description="User who owns this connection")
-    org_id: Optional[str] = Field(None, description="Organization ID (if connection is org-level)")
+    org_id: str = Field(..., description="Organization that owns this connection")
+    created_by: str = Field(..., description="User ID who created this connection")
+    
+    # Legacy field for backward compatibility during migration
+    user_id: Optional[str] = Field(None, description="[DEPRECATED] User who owns this connection - use org_id instead")
     
     # AWS Account Information
     aws_account_id: str = Field(..., description="AWS Account ID (12 digits)")
@@ -143,15 +164,127 @@ class AWSConnection(BaseModel):
         json_encoders = {ObjectId: str, datetime: lambda v: v.isoformat()}
         json_schema_extra = {
             "example": {
-                "user_id": "550e8400-e29b-41d4-a716-446655440000",
+                "org_id": "550e8400-e29b-41d4-a716-446655440000",
+                "created_by": "550e8400-e29b-41d4-a716-446655440001",
                 "aws_account_id": "123456789012",
                 "role_arn": "arn:aws:iam::123456789012:role/InversionDeployerRole",
                 "status": "active",
-                "external_id": "550e8400-e29b-41d4-a716-446655440001",
+                "external_id": "550e8400-e29b-41d4-a716-446655440002",
                 "region": "us-east-1",
                 "created_at": "2024-01-01T00:00:00Z",
                 "updated_at": "2024-01-01T00:00:00Z",
                 "claimed_at": "2024-01-01T00:05:00Z"
+            }
+        }
+
+
+# ============================================================================
+# Organization Model
+# ============================================================================
+
+class Organization(BaseModel):
+    """Organization model for multi-user AWS account sharing."""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    org_id: str = Field(..., description="Unique organization identifier (UUID)")
+    name: str = Field(..., description="Organization name")
+    slug: Optional[str] = Field(None, description="URL-friendly organization slug")
+    
+    # Owner information
+    owner_id: str = Field(..., description="User ID of the organization owner")
+    
+    # Timestamps
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # Metadata
+    description: Optional[str] = Field(None, description="Organization description")
+    
+    # AWS Account
+    default_aws_account_id: Optional[str] = Field(
+        None, 
+        description="Default AWS Account ID for this organization. Used when members connect via AWS."
+    )
+    
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str, datetime: lambda v: v.isoformat()}
+        json_schema_extra = {
+            "example": {
+                "org_id": "550e8400-e29b-41d4-a716-446655440000",
+                "name": "Acme Corp",
+                "slug": "acme-corp",
+                "owner_id": "550e8400-e29b-41d4-a716-446655440001",
+                "description": "Main organization for Acme Corp",
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z"
+            }
+        }
+
+
+# ============================================================================
+# Organization Member Model
+# ============================================================================
+
+class OrganizationMember(BaseModel):
+    """Represents a user's membership in an organization."""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    org_id: str = Field(..., description="Organization ID")
+    user_id: str = Field(..., description="User ID")
+    role: OrganizationRole = Field(default=OrganizationRole.MEMBER, description="User's role in org")
+    
+    # Timestamps
+    joined_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    invited_by: Optional[str] = Field(None, description="User ID who invited this member")
+    
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str, datetime: lambda v: v.isoformat()}
+        json_schema_extra = {
+            "example": {
+                "org_id": "550e8400-e29b-41d4-a716-446655440000",
+                "user_id": "550e8400-e29b-41d4-a716-446655440001",
+                "role": "member",
+                "joined_at": "2024-01-01T00:00:00Z",
+                "invited_by": "550e8400-e29b-41d4-a716-446655440002"
+            }
+        }
+
+
+# ============================================================================
+# Organization Invitation Model
+# ============================================================================
+
+class OrganizationInvitation(BaseModel):
+    """Invitation for a user to join an organization."""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    org_id: str = Field(..., description="Organization ID")
+    email: EmailStr = Field(..., description="Email of invited user")
+    role: OrganizationRole = Field(default=OrganizationRole.MEMBER, description="Role to assign")
+    token: str = Field(..., description="Unique invitation token (UUID)")
+    invited_by: str = Field(..., description="User ID who sent invitation")
+    
+    status: InvitationStatus = Field(default=InvitationStatus.PENDING)
+    expires_at: datetime = Field(..., description="Invitation expiration")
+    accepted_at: Optional[datetime] = Field(None)
+    
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    class Config:
+        populate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str, datetime: lambda v: v.isoformat()}
+        json_schema_extra = {
+            "example": {
+                "org_id": "550e8400-e29b-41d4-a716-446655440000",
+                "email": "user@example.com",
+                "role": "member",
+                "token": "550e8400-e29b-41d4-a716-446655440003",
+                "invited_by": "550e8400-e29b-41d4-a716-446655440001",
+                "status": "pending",
+                "expires_at": "2024-01-08T00:00:00Z",
+                "created_at": "2024-01-01T00:00:00Z"
             }
         }
 
@@ -202,3 +335,54 @@ def dict_to_aws_connection(data: dict) -> AWSConnection:
         del conn_data["_id"]
     
     return AWSConnection(**conn_data)
+
+
+def organization_to_dict(org: Organization) -> dict:
+    """Convert Organization model to dictionary for MongoDB insertion."""
+    org_dict = org.model_dump(by_alias=True, exclude={"id"})
+    if org.id:
+        org_dict["_id"] = org.id
+    return org_dict
+
+
+def dict_to_organization(data: dict) -> Organization:
+    """Convert MongoDB document to Organization model."""
+    org_data = data.copy()
+    if "_id" in org_data:
+        org_data["id"] = str(org_data["_id"])
+        del org_data["_id"]
+    return Organization(**org_data)
+
+
+def organization_member_to_dict(member: OrganizationMember) -> dict:
+    """Convert OrganizationMember model to dictionary for MongoDB insertion."""
+    member_dict = member.model_dump(by_alias=True, exclude={"id"})
+    if member.id:
+        member_dict["_id"] = member.id
+    return member_dict
+
+
+def dict_to_organization_member(data: dict) -> OrganizationMember:
+    """Convert MongoDB document to OrganizationMember model."""
+    member_data = data.copy()
+    if "_id" in member_data:
+        member_data["id"] = str(member_data["_id"])
+        del member_data["_id"]
+    return OrganizationMember(**member_data)
+
+
+def organization_invitation_to_dict(invitation: OrganizationInvitation) -> dict:
+    """Convert OrganizationInvitation model to dictionary for MongoDB insertion."""
+    inv_dict = invitation.model_dump(by_alias=True, exclude={"id"})
+    if invitation.id:
+        inv_dict["_id"] = invitation.id
+    return inv_dict
+
+
+def dict_to_organization_invitation(data: dict) -> OrganizationInvitation:
+    """Convert MongoDB document to OrganizationInvitation model."""
+    inv_data = data.copy()
+    if "_id" in inv_data:
+        inv_data["id"] = str(inv_data["_id"])
+        del inv_data["_id"]
+    return OrganizationInvitation(**inv_data)

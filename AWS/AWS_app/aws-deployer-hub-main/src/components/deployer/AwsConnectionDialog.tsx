@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -20,7 +21,7 @@ import {
 import { AWS_REGIONS } from '@/types/aws';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { InfoIcon, ExternalLink, CheckCircle2, Loader2, AlertTriangle } from 'lucide-react';
-import { cloudformationLogin, cloudformationVerify, getCurrentUser, checkAwsAccount } from '@/lib/api';
+import { cloudformationLogin, cloudformationVerify, listOrganizations, getOrganization } from '@/lib/api';
 import { toast } from 'sonner';
 
 interface AwsConnectionDialogProps {
@@ -28,14 +29,17 @@ interface AwsConnectionDialogProps {
   onOpenChange: (open: boolean) => void;
   onRoleArnReceived: (roleArn: string, accountId: string, externalId: string, region: string) => Promise<void>;
   required?: boolean;
+  onHasNoOrg?: (hasNoOrg: boolean) => void; // Callback to notify parent when user has no org
 }
 
 export function AwsConnectionDialog({ 
   open, 
   onOpenChange, 
   onRoleArnReceived,
-  required = false 
+  required = false,
+  onHasNoOrg
 }: AwsConnectionDialogProps) {
+  const navigate = useNavigate();
   const [step, setStep] = useState<'account' | 'verify'>('account');
   const [accountId, setAccountId] = useState('');
   const [region, setRegion] = useState('us-east-1');
@@ -44,53 +48,63 @@ export function AwsConnectionDialog({
   const [error, setError] = useState<string | null>(null);
   const [cloudFormationData, setCloudFormationData] = useState<any>(null);
   const [consoleOpened, setConsoleOpened] = useState(false);
-  const [accountError, setAccountError] = useState<string | null>(null);
+  const [orgId, setOrgId] = useState<string | null>(null);
+  const [organization, setOrganization] = useState<any>(null);
+  const [hasNoOrg, setHasNoOrg] = useState(false);
 
-  // Auto-fill AWS account ID when dialog opens
+  // Reset state when dialog closes
   useEffect(() => {
-    if (open && step === 'account' && !accountId) {
-      getCurrentUser()
-        .then((user) => {
-          if (user.aws_account_id) {
-            setAccountId(user.aws_account_id);
-            // Check if this account is associated with someone else
-            checkAwsAccount(user.aws_account_id)
-              .then((result) => {
-                if (result.associated_with_other_user) {
-                  setAccountError(result.message);
-                } else {
-                  setAccountError(null);
+    if (!open) {
+      setStep('account');
+      setAccountId('');
+      setError(null);
+      setCloudFormationData(null);
+      setConsoleOpened(false);
+      setOrgId(null);
+      setOrganization(null);
+      setHasNoOrg(false);
+    }
+  }, [open]);
+
+  // Load user's organization when dialog opens
+  useEffect(() => {
+    if (open && !orgId) {
+      listOrganizations()
+        .then((response) => {
+          if (response.organizations && response.organizations.length > 0) {
+            // Use the user's owned org if they own one, otherwise use the first org
+            const ownedOrg = response.organizations.find((org: any) => org.role === 'owner');
+            const selectedOrg = ownedOrg || response.organizations[0];
+            setOrgId(selectedOrg.org_id);
+            
+            // Load organization details to get default AWS account ID
+            getOrganization(selectedOrg.org_id)
+              .then((orgResponse) => {
+                setOrganization(orgResponse.organization);
+                
+                // Auto-fill AWS account ID from organization's default if available
+                if (orgResponse.organization.default_aws_account_id && !accountId) {
+                  setAccountId(orgResponse.organization.default_aws_account_id);
                 }
               })
               .catch(() => {
-                // Ignore errors when checking
+                // Ignore errors when loading org details
               });
-          }
-        })
-        .catch(() => {
-          // User not logged in or error - ignore
-        });
-    }
-  }, [open, step, accountId]);
-
-  // Check AWS account when user types it
-  useEffect(() => {
-    if (accountId && accountId.match(/^\d{12}$/)) {
-      checkAwsAccount(accountId)
-        .then((result) => {
-          if (result.associated_with_other_user) {
-            setAccountError(result.message);
           } else {
-            setAccountError(null);
+            setHasNoOrg(true);
+            setError('You must be a member of an organization to connect AWS accounts. Please join or create an organization first.');
+            // Notify parent component
+            if (onHasNoOrg) {
+              onHasNoOrg(true);
+            }
           }
         })
-        .catch(() => {
-          // Ignore errors
+        .catch((err) => {
+          const errorMessage = err instanceof Error ? err.message : 'Failed to load organizations';
+          setError(errorMessage);
         });
-    } else {
-      setAccountError(null);
     }
-  }, [accountId]);
+  }, [open, orgId, accountId]);
 
   const handleAccountSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -98,19 +112,49 @@ export function AwsConnectionDialog({
     setLoading(true);
 
     try {
-      // Validate account ID (12 digits)
-      if (!accountId.match(/^\d{12}$/)) {
-        setError('AWS Account ID must be exactly 12 digits');
+      if (!orgId) {
+        setError('Organization ID is required. Please ensure you are a member of an organization.');
         setLoading(false);
         return;
       }
 
-      const response = await cloudformationLogin(accountId, region);
+      // Check if organization has a default AWS account ID
+      if (!organization?.default_aws_account_id) {
+        setError('Your organization does not have a default AWS Account ID set. Please go to Organization Settings to set one before connecting.');
+        toast.error('Organization AWS Account ID required');
+        setLoading(false);
+        return;
+      }
+
+      // Use organization's default AWS account ID
+      const awsAccountIdToUse = organization.default_aws_account_id;
+      
+      // Validate account ID (12 digits)
+      if (!awsAccountIdToUse.match(/^\d{12}$/)) {
+        setError('Organization AWS Account ID must be exactly 12 digits');
+        setLoading(false);
+        return;
+      }
+
+      // Update accountId to match organization's default
+      setAccountId(awsAccountIdToUse);
+
+      const response = await cloudformationLogin(awsAccountIdToUse, region, orgId);
       setCloudFormationData(response);
       setStep('verify');
       toast.success('CloudFormation template ready!');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to initialize AWS connection');
+      // Better error handling - extract message from error object
+      let errorMessage = 'Failed to initialize AWS connection';
+      if (err instanceof Error) {
+        errorMessage = err.message;
+      } else if (typeof err === 'object' && err !== null) {
+        const errObj = err as any;
+        errorMessage = errObj.detail || errObj.message || errObj.error || JSON.stringify(errObj);
+      } else if (typeof err === 'string') {
+        errorMessage = err;
+      }
+      setError(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -125,25 +169,66 @@ export function AwsConnectionDialog({
   };
 
   const handleVerify = async () => {
+    if (!orgId) {
+      setError('Organization ID is required. Please ensure you are a member of an organization.');
+      toast.error('Organization ID is required');
+      return;
+    }
+
+    // Check if organization has a default AWS account ID
+    if (!organization?.default_aws_account_id) {
+      setError('Your organization does not have a default AWS Account ID set. Please go to Organization Settings to set one before verifying the connection.');
+      toast.error('Organization AWS Account ID required');
+      return;
+    }
+
+    // Only allow verification with the organization's default AWS account ID
+    if (accountId !== organization.default_aws_account_id) {
+      setError(`You can only verify connections using your organization's AWS Account ID (${organization.default_aws_account_id}). Please use the organization's AWS ID.`);
+      toast.error('Must use organization AWS Account ID');
+      return;
+    }
+
     setError(null);
     setVerifying(true);
 
     try {
-      const response = await cloudformationVerify(accountId, region);
+      const response = await cloudformationVerify(organization.default_aws_account_id, region, orgId);
       
       // Success! Call the callback with the session info
       // The role ARN is computed automatically, so we pass it from the response
-      await onRoleArnReceived(response.role_arn, accountId, '', region);
+      await onRoleArnReceived(response.role_arn, organization.default_aws_account_id, '', region);
       
       // Reset form on success
       setAccountId('');
       setStep('account');
       setCloudFormationData(null);
       setConsoleOpened(false);
-      onOpenChange(false);
+      // Reload organization to refresh default AWS account ID if it was set
+      if (orgId) {
+        getOrganization(orgId)
+          .then((orgResponse) => {
+            setOrganization(orgResponse.organization);
+          })
+          .catch(() => {
+            // Ignore errors
+          });
+      }
+      handleDialogOpenChange(false);
       toast.success(`Connected to account ${response.account_id}!`);
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Connection failed';
+      // Better error handling - extract message from error object
+      let errorMessage = 'Connection failed';
+      if (err instanceof Error) {
+        errorMessage = err.message;
+      } else if (typeof err === 'object' && err !== null) {
+        // Try to extract detail or message from error object
+        const errObj = err as any;
+        errorMessage = errObj.detail || errObj.message || errObj.error || JSON.stringify(errObj);
+      } else if (typeof err === 'string') {
+        errorMessage = err;
+      }
+      
       setError(errorMessage);
       toast.error(errorMessage);
     } finally {
@@ -151,17 +236,18 @@ export function AwsConnectionDialog({
     }
   };
 
+  const handleDialogOpenChange = (newOpen: boolean) => {
+    // Always allow closing - let the parent component decide
+    // The parent can check hasNoOrg via the callback if needed
+    onOpenChange(newOpen);
+  };
+
   return (
     <Dialog 
       open={open} 
-      onOpenChange={(newOpen) => {
-        if (required && !newOpen) {
-          return;
-        }
-        onOpenChange(newOpen);
-      }}
+      onOpenChange={handleDialogOpenChange}
     >
-      <DialogContent className={`sm:max-w-[550px] max-h-[90vh] flex flex-col ${required ? '[&>button.absolute]:hidden' : ''}`}>
+      <DialogContent className="sm:max-w-[550px] max-h-[90vh] flex flex-col">
         {step === 'account' ? (
           <>
             <DialogHeader>
@@ -193,15 +279,31 @@ export function AwsConnectionDialog({
                     required
                     maxLength={12}
                     className="font-mono text-sm"
+                    disabled={!!organization?.default_aws_account_id || loading}
                   />
                   <p className="text-xs text-muted-foreground">
-                    Your 12-digit AWS Account ID
+                    {organization?.default_aws_account_id ? (
+                      <>
+                        Using your organization's AWS Account ID: <span className="font-semibold">{organization.default_aws_account_id}</span>
+                        <span className="block mt-1 text-muted-foreground/80">
+                          This value is set in your Organization Settings and cannot be changed here.
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        Your 12-digit AWS Account ID
+                        <span className="block mt-1 text-muted-foreground/80">
+                          Note: You must set a default AWS Account ID in Organization Settings before connecting.
+                        </span>
+                      </>
+                    )}
                   </p>
-                  {accountError && (
-                    <Alert variant="destructive" className="mt-2">
+                  {!organization?.default_aws_account_id && (
+                    <Alert className="mt-2">
                       <AlertTriangle className="h-4 w-4" />
                       <AlertDescription className="text-xs">
-                        {accountError}
+                        Your organization does not have a default AWS Account ID set. Please go to{' '}
+                        <a href="/organization" className="underline font-semibold">Organization Settings</a> to set one before connecting.
                       </AlertDescription>
                     </Alert>
                   )}
@@ -226,22 +328,50 @@ export function AwsConnectionDialog({
                 {error && (
                   <Alert variant="destructive" className="max-h-[200px] overflow-y-auto">
                     <AlertDescription className="break-words">{error}</AlertDescription>
+                    {hasNoOrg && (
+                      <div className="mt-3 flex gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            handleDialogOpenChange(false);
+                            navigate('/organization');
+                          }}
+                        >
+                          Go to Organizations
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handleDialogOpenChange(false)}
+                        >
+                          Close
+                        </Button>
+                      </div>
+                    )}
                   </Alert>
                 )}
               </div>
 
               <DialogFooter>
-                {!required && (
+                {(!required || hasNoOrg) && (
                   <Button
                     type="button"
                     variant="outline"
-                    onClick={() => onOpenChange(false)}
+                    onClick={() => {
+                      if (hasNoOrg) {
+                        navigate('/organization');
+                      }
+                      handleDialogOpenChange(false);
+                    }}
                     disabled={loading}
                   >
-                    Cancel
+                    {hasNoOrg ? 'Go to Organizations' : 'Cancel'}
                   </Button>
                 )}
-                <Button type="submit" disabled={loading || !accountId || accountId.length !== 12 || !!accountError}>
+                <Button type="submit" disabled={loading || !organization?.default_aws_account_id || hasNoOrg}>
                   {loading ? 'Preparing...' : 'Continue'}
                 </Button>
               </DialogFooter>
@@ -257,19 +387,41 @@ export function AwsConnectionDialog({
             </DialogHeader>
             
             <div className="space-y-4 py-4 overflow-y-auto flex-1 min-h-0">
-              <Alert>
-                <InfoIcon className="h-4 w-4" />
-                <AlertDescription className="text-sm">
-                  <strong>Quick steps:</strong>
-                  <ol className="list-decimal list-inside mt-2 space-y-1 text-xs">
-                    <li>Click "Open AWS Console" below - the CloudFormation quick create page will open</li>
-                    <li>All values are already pre-filled (template, stack name, parameters)</li>
-                    <li>Simply click the "Create stack" button</li>
-                    <li>Wait for stack creation to complete (usually 30-60 seconds)</li>
-                    <li>Return here and click "Verify Connection" - we'll automatically connect!</li>
-                  </ol>
-                </AlertDescription>
-              </Alert>
+              {!organization?.default_aws_account_id ? (
+                <Alert variant="destructive">
+                  <AlertTriangle className="h-4 w-4" />
+                  <AlertDescription className="text-sm">
+                    <strong>Organization AWS Account ID Required</strong>
+                    <p className="mt-1 text-xs">
+                      Your organization does not have a default AWS Account ID set. Please go to{' '}
+                      <a href="/organization" className="underline font-semibold">Organization Settings</a> to set one before verifying the connection.
+                    </p>
+                  </AlertDescription>
+                </Alert>
+              ) : (
+                <Alert>
+                  <InfoIcon className="h-4 w-4" />
+                  <AlertDescription className="text-sm">
+                    <strong>Quick steps:</strong>
+                    <ol className="list-decimal list-inside mt-2 space-y-1 text-xs">
+                      <li>Click "Open AWS Console" below - the CloudFormation quick create page will open</li>
+                      <li>All values are already pre-filled (template, stack name, parameters)</li>
+                      <li>Simply click the "Create stack" button</li>
+                      <li>Wait for stack creation to complete (usually 30-60 seconds)</li>
+                      <li>Return here and click "Verify Connection" - we'll automatically connect!</li>
+                    </ol>
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {organization?.default_aws_account_id && (
+                <Alert>
+                  <InfoIcon className="h-4 w-4" />
+                  <AlertDescription className="text-sm">
+                    <strong>Using Organization AWS Account ID:</strong> {organization.default_aws_account_id}
+                  </AlertDescription>
+                </Alert>
+              )}
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
@@ -340,7 +492,7 @@ export function AwsConnectionDialog({
               <Button 
                 type="button"
                 onClick={handleVerify}
-                disabled={verifying}
+                disabled={verifying || !organization?.default_aws_account_id}
               >
                 {verifying ? (
                   <>

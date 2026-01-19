@@ -57,6 +57,11 @@ app.include_router(auth_router)
 app.include_router(docker_router)
 app.include_router(file_transfer_router)
 try:
+    from org_routes import router as org_router
+    app.include_router(org_router)
+except ImportError as e:
+    print(f"Warning: org_routes not available: {e}")
+try:
     from terminal_routes import router as terminal_router
     app.include_router(terminal_router)
 except ImportError:

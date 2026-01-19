@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { AwsConfig, RunningInstance, LogEntry, TransferStatus, AwsMetadata } from '@/types/aws';
-import { assumeRoleLogin, checkRepositoryStatus, connect, deployStream, downloadFile, fetchInstances, fetchMetadata, loginSso, terminate, uploadFile } from '@/lib/api';
+import { assumeRoleLogin, checkRepositoryStatus, connect, deployStream, downloadFile, fetchInstances, fetchMetadata, loginSso, terminate, uploadFile, listOrganizations } from '@/lib/api';
 import { toast } from 'sonner';
 
 const STORAGE_KEY = 'inversion-deployer-config';
@@ -49,6 +49,22 @@ export function useAwsConfig() {
     repositoryUri?: string;
     message: string;
   } | null>(null);
+  const [orgId, setOrgId] = useState<string | null>(null);
+
+  // Load user's organization
+  useEffect(() => {
+    listOrganizations()
+      .then((response) => {
+        if (response.organizations && response.organizations.length > 0) {
+          // Use the user's owned org if they own one, otherwise use the first org
+          const ownedOrg = response.organizations.find((org: any) => org.role === 'owner');
+          setOrgId(ownedOrg?.org_id || response.organizations[0].org_id);
+        }
+      })
+      .catch(() => {
+        // Ignore errors - user might not be in an org yet
+      });
+  }, []);
 
   // Check for existing session on load
   useEffect(() => {
@@ -97,6 +113,13 @@ export function useAwsConfig() {
   const clearLogs = () => setLogs([]);
 
   const handleRoleLogin = async (roleArn: string, accountId: string, externalId: string, region: string) => {
+    if (!orgId) {
+      const errorMsg = 'Organization ID is required. Please ensure you are a member of an organization.';
+      addLog(errorMsg, 'error');
+      toast.error(errorMsg);
+      throw new Error(errorMsg);
+    }
+
     try {
       addLog('Connecting to AWS account...', 'info');
       setProgress(15);
@@ -105,6 +128,7 @@ export function useAwsConfig() {
         accountId,
         externalId: externalId || undefined,
         region,
+        orgId,
       });
       
       // Store session ID

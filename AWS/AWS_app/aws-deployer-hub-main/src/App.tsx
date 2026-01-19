@@ -5,6 +5,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
+import OrganizationManagement from "./pages/OrganizationManagement";
+import OrganizationSettings from "./pages/OrganizationSettings";
+import AwsDeployer from "./pages/AwsDeployer";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -19,6 +22,9 @@ const App = () => (
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/login" element={<Login />} />
           <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/organization" element={<OrganizationManagement />} />
+          <Route path="/organization/:orgId/settings" element={<OrganizationSettings />} />
+          <Route path="/aws" element={<AwsDeployer />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>
